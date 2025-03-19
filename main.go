@@ -798,6 +798,13 @@ func showSystemInfo(window fyne.Window) {
 func createProcessorMemoryInfo() fyne.CanvasObject {
 	// Заголовок раздела процессора
 	cpuTitle := widget.NewLabelWithStyle("Процессор", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	cpuTitle.Alignment = fyne.TextAlignCenter
+
+	// Фоновый прямоугольник для заголовка
+	cpuTitleBg := canvas.NewRectangle(color.NRGBA{69, 71, 90, 255})
+	cpuTitleBg.SetMinSize(fyne.NewSize(360, 30))
+
+	cpuTitleContainer := container.NewStack(cpuTitleBg, cpuTitle)
 
 	// Информация о процессоре
 	cpuModel := widget.NewLabel(fmt.Sprintf("Модель: %s", sysInfo.Processor.Model))
@@ -807,8 +814,7 @@ func createProcessorMemoryInfo() fyne.CanvasObject {
 	cpuArch := widget.NewLabel(fmt.Sprintf("Архитектура: %s", sysInfo.Processor.Architecture))
 
 	// Контейнер для информации о процессоре
-	cpuContainer := container.NewVBox(
-		cpuTitle,
+	cpuDataContainer := container.NewVBox(
 		cpuModel,
 		cpuCores,
 		cpuFreq,
@@ -816,8 +822,24 @@ func createProcessorMemoryInfo() fyne.CanvasObject {
 		cpuArch,
 	)
 
+	// Добавляем отступы к данным процессора
+	cpuContainer := container.NewBorder(
+		cpuTitleContainer,
+		nil,
+		nil,
+		nil,
+		container.NewPadded(cpuDataContainer),
+	)
+
 	// Заголовок раздела памяти
 	memTitle := widget.NewLabelWithStyle("Оперативная память", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	memTitle.Alignment = fyne.TextAlignCenter
+
+	// Фоновый прямоугольник для заголовка
+	memTitleBg := canvas.NewRectangle(color.NRGBA{69, 71, 90, 255})
+	memTitleBg.SetMinSize(fyne.NewSize(360, 30))
+
+	memTitleContainer := container.NewStack(memTitleBg, memTitle)
 
 	// Информация о памяти
 	memTotal := widget.NewLabel(fmt.Sprintf("Всего: %.2f ГБ", float64(sysInfo.Memory.Total)/(1024*1024*1024)))
@@ -825,7 +847,6 @@ func createProcessorMemoryInfo() fyne.CanvasObject {
 
 	// Контейнер для информации о памяти
 	memItems := []fyne.CanvasObject{
-		memTitle,
 		memTotal,
 		memFreq,
 	}
@@ -841,14 +862,34 @@ func createProcessorMemoryInfo() fyne.CanvasObject {
 		memItems = append(memItems, slotInfo)
 	}
 
-	memContainer := container.NewVBox(memItems...)
+	memDataContainer := container.NewVBox(memItems...)
 
-	// Объединяем в один контейнер
-	return container.NewVBox(
-		container.NewVBox(cpuContainer),
-		widget.NewSeparator(),
-		container.NewVBox(memContainer),
+	// Добавляем отступы к данным памяти
+	memContainer := container.NewBorder(
+		memTitleContainer,
+		nil,
+		nil,
+		nil,
+		container.NewPadded(memDataContainer),
 	)
+
+	// Фоновый прямоугольник для контейнера
+	bgRect := canvas.NewRectangle(color.NRGBA{45, 45, 60, 255})
+
+	// Объединяем в один контейнер с рамкой
+	content := container.NewBorder(
+		nil,
+		nil,
+		nil,
+		nil,
+		container.NewVBox(
+			cpuContainer,
+			widget.NewSeparator(),
+			memContainer,
+		),
+	)
+
+	return container.NewStack(bgRect, content)
 }
 
 // Создает и возвращает контейнер с информацией о GPU и сети
