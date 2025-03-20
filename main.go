@@ -962,8 +962,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-			// Добавляем обработку клавиши 'b' для возврата к экрану системной информации,
-			// но не во время ввода серийного номера
 		case "b":
 			// Возврат к экрану системной информации из определенных состояний
 			if m.state != stateInit && m.state != stateShowInfo && m.state != stateAskSerial {
@@ -1074,18 +1072,18 @@ func (m model) View() string {
 		Bold(true).
 		Foreground(lipgloss.Color("#FAFAFA")).
 		Background(lipgloss.Color("#1D1D1D")).
-		Margin(0, 0, 0, 0).  // Убираем все внешние отступы
-		Padding(1, 0, 0, 0). // Добавляем небольшой отступ сверху
+		Padding(1, 0, 0, 0).
 		Width(m.width).
 		Align(lipgloss.Center)
 
+	// Уменьшаем внутренние отступы для основных контейнеров
 	borderStyle := lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("#3C3C3C")).
-		Margin(0, 0, 0, 0). // Убираем все внешние отступы
-		Padding(0, 1).      // Оставляем минимальные внутренние отступы
-		Width(m.width - 2)  // -2 для учета границ
+		Padding(0, 0).
+		Width(m.width - 2)
 
+	// Изменяем стили секций для более точного контроля размеров
 	sectionStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#3C3C3C")).
@@ -1115,8 +1113,7 @@ func (m model) View() string {
 
 	footerStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#CDCDCD")).
-		Margin(0, 0, 0, 0). // Убираем все внешние отступы
-		Padding(0, 1).      // Минимальные внутренние отступы
+		Padding(0, 1).
 		Width(m.width)
 
 	overlayStyle := lipgloss.NewStyle().
@@ -1180,14 +1177,11 @@ func (m model) View() string {
 		)
 	}
 
-	// Точно вычисляем размеры с учетом всех границ и отступов
-	headerHeight := 2             // Высота заголовка (с учетом padding)
-	footerHeight := 1             // Высота футера
-	spacingBetweenComponents := 0 // Устраняем отступы между компонентами
-	contentHeight := m.height - headerHeight - footerHeight - spacingBetweenComponents
+	// Улучшенный расчет размеров для отображения
+	headerHeight := 1
+	footerHeight := 1
+	contentHeight := m.height - headerHeight - footerHeight - 2
 
-	// Точно настраиваем компоненты для заполнения всего экрана
-	// Используем функции JoinVertical для точного контроля расположения
 	if m.state == stateInit {
 		spinnerContent := fmt.Sprintf(
 			"%s\n\n%s",
@@ -1217,133 +1211,128 @@ func (m model) View() string {
 		)
 	}
 
-	// Базовый вывод информации о системе
-	mainContent := strings.Builder{}
+	// ИСПРАВЛЕННАЯ ВЕРСИЯ ОТОБРАЖЕНИЯ СИСТЕМНОЙ ИНФОРМАЦИИ
 
-	// Расставляем информацию в две колонки
-	// Колонка 1: Процессор и Сеть
-	// Колонка 2: Память, GPU и Хранение
-
-	// Корректный расчет размеров интерфейса с учетом отступов
-	// Рассчитываем ширину, которая точно делится на 2 (для двух колонок)
-	totalPadding := 8 // Общий отступ (границы, внутренние отступы)
-	usableWidth := m.width - totalPadding
-
-	// Округляем вниз до четного числа, чтобы избежать проблем с делением
-	if usableWidth%2 != 0 {
-		usableWidth--
-	}
-
-	// Вычисляем точную ширину каждой колонки
-	columnWidth := usableWidth / 2
-
-	// Внутренние отступы для каждой секции
-	sectionPadding := 2
-
-	// Точная ширина содержимого секции
-	sectionWidth := columnWidth - (sectionPadding * 2)
-
-	// Определяем режим отображения - одна или две колонки
+	// Определяем, будем ли использовать две колонки
+	// Используем две колонки, только если экран достаточно широкий
 	twoColumnMode := m.width >= 100
 
-	// Если экран слишком узкий, используем одну колонку
-	if !twoColumnMode {
-		columnWidth = usableWidth
-		sectionWidth = columnWidth - (sectionPadding * 2)
+	// Расчет размеров колонок с учетом границ и отступов
+	columnPadding := 1 // Отступ внутри колонки
+	columnSpacing := 2 // Расстояние между колонками
+	borderWidth := 2   // Ширина границы
+
+	// Доступная ширина для контента с учетом основной границы
+	availableWidth := m.width - (borderWidth * 2)
+
+	var leftColumnWidth, rightColumnWidth int
+
+	if twoColumnMode {
+		// В режиме двух колонок делим пространство пополам
+		leftColumnWidth = (availableWidth - columnSpacing) / 2
+		rightColumnWidth = (availableWidth - columnSpacing) / 2
+	} else {
+		// В режиме одной колонки используем всю доступную ширину
+		leftColumnWidth = availableWidth
+		rightColumnWidth = availableWidth
 	}
 
-	// Формируем левую колонку
-	leftCol := strings.Builder{}
+	// Ширина для секций внутри колонок (с учетом отступов и границ секций)
+	sectionBorderWidth := 2
+	leftSectionWidth := leftColumnWidth - (sectionBorderWidth * 2) - (columnPadding * 2)
+	rightSectionWidth := rightColumnWidth - (sectionBorderWidth * 2) - (columnPadding * 2)
 
-	// Процессор
+	// Создаем лого Troubadour
+	logoContent := strings.Builder{}
+	logoContent.WriteString("     ♪ ♫ ♪\n")
+	logoContent.WriteString("    /T\\    \n")
+	logoContent.WriteString("   /___\\   \n")
+	logoContent.WriteString("  // | \\\\  \n")
+	logoContent.WriteString(" //__|__\\\\ \n")
+	logoContent.WriteString("    |||    \n")
+	logoContent.WriteString("  ~=====~  \n")
+
+	logoStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#F5D76E")).
+		Align(lipgloss.Center).
+		Width(leftColumnWidth - 2)
+
+	logoSection := logoStyle.Render(logoContent.String())
+
+	// Формируем левую колонку
+	// ПРОЦЕССОР
 	cpuContent := strings.Builder{}
-	cpuContent.WriteString(fmt.Sprintf("Model: %s\n", m.sysInfo.Processor.Model))
+	cpuContent.WriteString(fmt.Sprintf("Model: %s\n", truncateString(m.sysInfo.Processor.Model, leftSectionWidth-8)))
 	cpuContent.WriteString(fmt.Sprintf("Cores: %d (Threads: %d)\n", m.sysInfo.Processor.Cores, m.sysInfo.Processor.Threads))
 	cpuContent.WriteString(fmt.Sprintf("Freq: %s\n", m.sysInfo.Processor.Frequency))
 
 	cacheStr := ""
 	for level, size := range m.sysInfo.Processor.Cache {
 		if cacheStr != "" {
-			cacheStr += " "
+			cacheStr += ", "
 		}
-		cacheStr += fmt.Sprintf("%s:%s", level, size)
+		cacheStr += fmt.Sprintf("%s: %s", level, size)
 	}
-	cpuContent.WriteString(fmt.Sprintf("Cache: %s", cacheStr))
+	cpuContent.WriteString(fmt.Sprintf("Cache: %s", truncateString(cacheStr, leftSectionWidth-8)))
 
-	// Создаем секцию с фиксированной шириной
-	procSection := sectionStyle.Copy().Width(sectionWidth).Render(
-		fmt.Sprintf("%s\n%s",
+	procSection := sectionStyle.Copy().
+		Width(leftColumnWidth - 2).
+		Render(fmt.Sprintf("%s\n%s",
 			sectionTitleStyle.Render("─── PROCESSOR ───"),
 			cpuContent.String(),
-		),
-	)
-	leftCol.WriteString(procSection)
+		))
 
-	// Сеть
+	// СЕТЬ
 	netContent := strings.Builder{}
 	for _, net := range m.sysInfo.Network {
-		netContent.WriteString(fmt.Sprintf("%s: %s\n", net.Interface, net.Model))
+		if net.Model != "" {
+			netContent.WriteString(fmt.Sprintf("%s: %s\n",
+				net.Interface,
+				truncateString(net.Model, leftSectionWidth-len(net.Interface)-3)))
+		} else {
+			netContent.WriteString(fmt.Sprintf("%s\n", net.Interface))
+		}
 		netContent.WriteString(fmt.Sprintf("MAC: %s\n\n", net.MAC))
 	}
 
-	// Используем одну новую строку для отступа
-	leftCol.WriteString("\n")
-
-	// Создаем секцию с фиксированной шириной
-	netSection := sectionStyle.Copy().Width(sectionWidth).Render(
-		fmt.Sprintf("%s\n%s",
+	netSection := sectionStyle.Copy().
+		Width(leftColumnWidth - 2).
+		Render(fmt.Sprintf("%s\n%s",
 			sectionTitleStyle.Render("─── NETWORK ───"),
 			netContent.String(),
-		),
-	)
-	leftCol.WriteString(netSection)
+		))
 
 	// Формируем правую колонку
-	rightCol := strings.Builder{}
-
-	// Память - исправленное форматирование с правильным выравниванием
+	// ПАМЯТЬ
 	memContent := strings.Builder{}
 	memContent.WriteString(fmt.Sprintf("Total: %s\n\n", m.sysInfo.Memory.Total))
 
 	for _, slot := range m.sysInfo.Memory.Slots {
-		// Очистка строк от спецсимволов и корректное выравнивание
 		slotManu := strings.TrimSpace(strings.ReplaceAll(slot.Manufacturer, "\n", " "))
 		slotSize := strings.TrimSpace(strings.ReplaceAll(slot.Size, "\n", " "))
 		slotSpeed := strings.TrimSpace(strings.ReplaceAll(slot.Speed, "\n", " "))
 		slotType := strings.TrimSpace(strings.ReplaceAll(slot.Type, "\n", " "))
 
-		// Ограничиваем длину строк для предотвращения переполнения
-		maxManuLength := sectionWidth / 3
-		if len(slotManu) > maxManuLength {
-			slotManu = slotManu[:maxManuLength] + "..."
-		}
-
 		memContent.WriteString(fmt.Sprintf("Slot %s: %s %s\n",
-			slot.ID, slotManu, slotSize))
+			slot.ID,
+			truncateString(slotManu, rightSectionWidth/4),
+			slotSize))
 		memContent.WriteString(fmt.Sprintf("        %s %s\n\n",
-			slotSpeed, slotType))
+			slotSpeed,
+			slotType))
 	}
 
-	// Создаем секцию с фиксированной шириной
-	memSection := sectionStyle.Copy().Width(sectionWidth).Render(
-		fmt.Sprintf("%s\n%s",
+	memSection := sectionStyle.Copy().
+		Width(rightColumnWidth - 2).
+		Render(fmt.Sprintf("%s\n%s",
 			sectionTitleStyle.Render("─── MEMORY ───"),
 			memContent.String(),
-		),
-	)
-	rightCol.WriteString(memSection)
+		))
 
-	// GPU - улучшенный вывод с дополнительной информацией и очисткой от спецсимволов
+	// GPU
 	gpuContent := strings.Builder{}
-
-	// Очистка и форматирование информации о GPU
 	gpuModel := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Model, "\n", " "))
-	maxModelLength := sectionWidth - 10
-	if len(gpuModel) > maxModelLength {
-		gpuModel = gpuModel[:maxModelLength] + "..."
-	}
-
-	gpuContent.WriteString(fmt.Sprintf("Model: %s\n", gpuModel))
+	gpuContent.WriteString(fmt.Sprintf("Model: %s\n", truncateString(gpuModel, rightSectionWidth-8)))
 
 	if m.sysInfo.GPU.Memory != "" {
 		gpuMem := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Memory, "\n", " "))
@@ -1352,15 +1341,12 @@ func (m model) View() string {
 
 	if m.sysInfo.GPU.Driver != "" {
 		gpuDriver := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Driver, "\n", " "))
-		if len(gpuDriver) > sectionWidth-10 {
-			gpuDriver = gpuDriver[:sectionWidth-10] + "..."
-		}
-		gpuContent.WriteString(fmt.Sprintf("Driver: %s\n", gpuDriver))
+		gpuContent.WriteString(fmt.Sprintf("Driver: %s\n", truncateString(gpuDriver, rightSectionWidth-9)))
 	}
 
 	if m.sysInfo.GPU.Vendor != "" {
 		gpuVendor := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Vendor, "\n", " "))
-		gpuContent.WriteString(fmt.Sprintf("Vendor: %s\n", gpuVendor))
+		gpuContent.WriteString(fmt.Sprintf("Vendor: %s\n", truncateString(gpuVendor, rightSectionWidth-9)))
 	}
 
 	if m.sysInfo.GPU.Resolution != "" {
@@ -1368,63 +1354,64 @@ func (m model) View() string {
 		gpuContent.WriteString(fmt.Sprintf("Resolution: %s\n", gpuRes))
 	}
 
-	// Используем одну новую строку для отступа
-	rightCol.WriteString("\n")
-
-	// Создаем секцию с фиксированной шириной
-	gpuSection := sectionStyle.Copy().Width(sectionWidth).Render(
-		fmt.Sprintf("%s\n%s",
+	gpuSection := sectionStyle.Copy().
+		Width(rightColumnWidth - 2).
+		Render(fmt.Sprintf("%s\n%s",
 			sectionTitleStyle.Render("─── GPU ───"),
 			gpuContent.String(),
-		),
-	)
-	rightCol.WriteString(gpuSection)
+		))
 
-	// Хранение
+	// ХРАНИЛИЩЕ
 	storageContent := strings.Builder{}
 	for _, storage := range m.sysInfo.Storage {
-		// Укорачиваем модель, если она слишком длинная
-		modelText := storage.Model
-		if len(modelText) > sectionWidth-15 {
-			modelText = modelText[:sectionWidth-15] + "..."
-		}
-
 		storageContent.WriteString(fmt.Sprintf("%s: %s %s\n",
-			storage.Type, modelText, storage.Size))
+			storage.Type,
+			truncateString(storage.Model, rightSectionWidth-len(storage.Type)-len(storage.Size)-3),
+			storage.Size))
+
 		if storage.Label != "" {
 			storageContent.WriteString(fmt.Sprintf("Label: %s\n", storage.Label))
 		}
 		storageContent.WriteString("\n")
 	}
 
-	// Используем одну новую строку для отступа
-	rightCol.WriteString("\n")
-
-	// Создаем секцию с фиксированной шириной
-	storageSection := sectionStyle.Copy().Width(sectionWidth).Render(
-		fmt.Sprintf("%s\n%s",
+	storageSection := sectionStyle.Copy().
+		Width(rightColumnWidth - 2).
+		Render(fmt.Sprintf("%s\n%s",
 			sectionTitleStyle.Render("─── STORAGE ───"),
 			storageContent.String(),
-		),
+		))
+
+	// Объединяем секции в колонки с точным позиционированием
+	var leftColumn, rightColumn string
+
+	leftColumn = lipgloss.JoinVertical(
+		lipgloss.Left,
+		logoSection,
+		procSection,
+		netSection,
 	)
-	rightCol.WriteString(storageSection)
 
-	// Формируем общий вывод и правильно размещаем колонки
-	mainContent = strings.Builder{}
+	rightColumn = lipgloss.JoinVertical(
+		lipgloss.Left,
+		memSection,
+		gpuSection,
+		storageSection,
+	)
 
-	// Если экран достаточно широкий, размещаем колонки рядом
+	// Формируем полное отображение
+	var mainContent string
+
 	if twoColumnMode {
-		// Разбиваем колонки на строки для правильного выравнивания
-		leftRows := strings.Split(leftCol.String(), "\n")
-		rightRows := strings.Split(rightCol.String(), "\n")
+		// В режиме двух колонок размещаем колонки рядом
+		rows := make([]string, 0)
 
-		// Определяем максимальное количество строк
-		maxRows := len(leftRows)
-		if len(rightRows) > maxRows {
-			maxRows = len(rightRows)
-		}
+		leftRows := strings.Split(leftColumn, "\n")
+		rightRows := strings.Split(rightColumn, "\n")
 
-		// Добавляем пустые строки, если необходимо
+		maxRows := max(len(leftRows), len(rightRows))
+
+		// Заполняем колонки пустыми строками до одинаковой длины
 		for len(leftRows) < maxRows {
 			leftRows = append(leftRows, "")
 		}
@@ -1432,46 +1419,33 @@ func (m model) View() string {
 			rightRows = append(rightRows, "")
 		}
 
-		// Формируем вывод с точным выравниванием колонок
-		// Добавляем точное количество пробелов между колонками для выравнивания
-		spacing := usableWidth - (columnWidth * 2) + 2 // +2 для небольшого визуального отступа
-		spacer := strings.Repeat(" ", spacing)
-
+		// Объединяем строки из обеих колонок
 		for i := 0; i < maxRows; i++ {
-			// Форматируем каждую строку с фиксированной шириной
-			mainContent.WriteString(fmt.Sprintf("%-*s%s%s\n",
-				columnWidth, leftRows[i], spacer, rightRows[i]))
+			leftPadded := leftRows[i]
+			if len(leftPadded) < leftColumnWidth {
+				leftPadded = leftPadded + strings.Repeat(" ", leftColumnWidth-len(leftPadded))
+			}
+
+			rows = append(rows, leftPadded+strings.Repeat(" ", columnSpacing)+rightRows[i])
 		}
+
+		mainContent = strings.Join(rows, "\n")
 	} else {
-		// На узких экранах выводим колонки одну под другой
-		mainContent.WriteString(leftCol.String())
-		mainContent.WriteString("\n\n")
-		mainContent.WriteString(rightCol.String())
+		// В режиме одной колонки размещаем колонки одну под другой
+		mainContent = leftColumn + "\n\n" + rightColumn
 	}
 
-	// Создаем вид, который заполняет весь доступный экран
-	headerHeight = 1                                           // Высота заголовка
-	footerHeight = 1                                           // Высота футера
-	contentHeight = m.height - headerHeight - footerHeight - 2 // Уменьшаем количество отступов с 4 до 2
-
-	// Расширяем стили для использования всего доступного пространства
-	titleStyle.Width(m.width)
-	// Уменьшаем отступы по ширине с 4 до 2, чтобы заполнить весь экран
-	fullWidthBorderStyle := borderStyle.Width(m.width - 2).Height(contentHeight)
-	fullWidthFooterStyle := footerStyle.Width(m.width - 10)
-
-	// Обновляем подсказки в нижней части экрана
-	footerContent := "Press ENTER to continue to video test..."
+	// Создаем финальное отображение
+	footer := footerStyle.Render("Press ENTER to continue to video test...")
 	if m.state != stateInit && m.state != stateShowInfo {
-		footerContent += " | Press B to return to system info"
+		footer = footerStyle.Render("Press ENTER to continue to video test... | Press B to return to system info")
 	}
 
-	// Используем JoinVertical для точного позиционирования
 	baseView := lipgloss.JoinVertical(
 		lipgloss.Left,
 		titleStyle.Render("TROUBADOUR"),
-		fullWidthBorderStyle.Height(contentHeight).Render(mainContent.String()),
-		fullWidthFooterStyle.Render(footerContent),
+		borderStyle.Copy().Height(contentHeight).Render(mainContent),
+		footer,
 	)
 
 	// Если не нужно показывать оверлей, возвращаем базовый вид
@@ -1558,7 +1532,6 @@ func (m model) View() string {
 
 	overlay := overlayStyle.Width(overlayWidth).Render(overlayContent)
 
-	// Исправление для липглосс - без WithBackground
 	// Создаем эффект наложения вручную
 	return lipgloss.PlaceHorizontal(
 		m.width,
@@ -1569,6 +1542,22 @@ func (m model) View() string {
 			overlay,
 		),
 	)
+}
+
+// Вспомогательная функция для обрезки длинных строк
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// Функция для получения максимального значения
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func main() {
