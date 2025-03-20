@@ -74,24 +74,26 @@ type StorageInfo struct {
 
 // Модели для TUI
 type model struct {
-	state           int // Состояние программы
-	sysInfo         SystemInfo
-	width           int
-	height          int
-	textInput       textinput.Model
-	spinner         spinner.Model
-	viewport        viewport.Model
-	err             error
-	userSerial      string
-	dmidecodeRaw    string
-	logFilePath     string
-	showOverlay     bool      // Показывать ли наложение
-	overlayContent  string    // Содержимое наложения
-	videoTestActive bool      // Активен ли видеотест
-	videoTestColor  int       // Текущий цвет видеотеста (0-red, 1-green, 2-blue, 3-testbars)
-	videoTestStart  time.Time // Время начала видеотеста
-	testPassed      bool      // Прошел ли видеотест успешно
-	serialMatched   bool      // Совпал ли серийный номер
+	state             int // Состояние программы
+	sysInfo           SystemInfo
+	width             int
+	height            int
+	textInput         textinput.Model
+	spinner           spinner.Model
+	viewport          viewport.Model
+	err               error
+	userSerial        string
+	dmidecodeRaw      string
+	logFilePath       string
+	showOverlay       bool      // Показывать ли наложение
+	overlayContent    string    // Содержимое наложения
+	videoTestActive   bool      // Активен ли видеотест
+	videoTestColor    int       // Текущий цвет видеотеста (0-red, 1-green, 2-blue, 3-testbars)
+	videoTestStart    time.Time // Время начала видеотеста
+	testPassed        bool      // Прошел ли видеотест успешно
+	serialMatched     bool      // Совпал ли серийный номер
+	logoAnimState     int       // Состояние анимации логотипа
+	progressAnimState int       // Состояние анимации прогресса
 }
 
 // Состояния программы
@@ -122,12 +124,14 @@ func initialModel() model {
 	vp := viewport.New(80, 20)
 
 	return model{
-		state:          stateInit,
-		textInput:      ti,
-		spinner:        s,
-		viewport:       vp,
-		showOverlay:    false,
-		videoTestColor: 0,
+		state:             stateInit,
+		textInput:         ti,
+		spinner:           s,
+		viewport:          vp,
+		showOverlay:       false,
+		videoTestColor:    0,
+		logoAnimState:     0,
+		progressAnimState: 0,
 	}
 }
 
@@ -137,6 +141,7 @@ func (m model) Init() tea.Cmd {
 		checkRootCmd,
 		spinner.Tick,
 		collectSystemInfoCmd,
+		updateLogoAnimationCmd,
 	)
 }
 
@@ -868,6 +873,59 @@ type logCreatedMsg struct {
 	fileName string
 }
 
+// Анимация логотипа
+type logoAnimUpdateMsg struct{}
+
+func updateLogoAnimationCmd() tea.Msg {
+	return logoAnimUpdateMsg{}
+}
+
+// Анимация прогресса
+type progressAnimUpdateMsg struct{}
+
+func updateProgressAnimationCmd() tea.Msg {
+	return progressAnimUpdateMsg{}
+}
+
+// Функция для отображения анимированного логотипа
+func getAnimatedLogo(state int) string {
+	logos := []string{
+		// Состояние 0
+		`  ♪ ♫ ♪  
+  /T\    
+ /___\   
+// | \\  
+\\__|__/ 
+  |||    
+~=====~  `,
+		// Состояние 1
+		`  ♫ ♪ ♫  
+  /T\    
+ /___\   
+// | \\  
+\\__|__/ 
+  \\//   
+~=====~  `,
+		// Состояние 2
+		`  ♪ ♫ ♪  
+  /T\\   
+ /___\\  
+// | \\  
+\\__|__/ 
+  //\\   
+~=====~  `,
+		// Состояние 3
+		`  ♫ ♪ ♫  
+ //T\    
+//___\   
+// | \\  
+\\__|__/ 
+  |o|    
+~=====~  `,
+	}
+	return logos[state]
+}
+
 // Дополнительные флаги для видеотеста
 type testWaitingForInput struct{}
 type testPatternFinishMsg struct{}
@@ -1036,7 +1094,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateSerialSuccess
 		m.showOverlay = true
 		m.serialMatched = true
-		return m, nil
+		return m, updateLogoAnimationCmd
 
 	case serialMismatchMsg:
 		// Серийный номер не совпал, показываем ошибку
@@ -1044,12 +1102,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.userSerial = msg.entered
 		m.showOverlay = true
 		m.serialMatched = false
-		return m, nil
+		return m, updateLogoAnimationCmd
 
 	case logCreatedMsg:
 		m.state = stateDone
 		m.logFilePath = msg.fileName
-		return m, nil
+		return m, updateLogoAnimationCmd
+
+	case logoAnimUpdateMsg:
+		m.logoAnimState = (m.logoAnimState + 1) % 4
+		return m, tea.Tick(time.Millisecond*300, func(time.Time) tea.Msg {
+			return logoAnimUpdateMsg{}
+		})
+
+	case progressAnimUpdateMsg:
+		m.progressAnimState = (m.progressAnimState + 1) % 4
+		return m, tea.Tick(time.Millisecond*200, func(time.Time) tea.Msg {
+			return progressAnimUpdateMsg{}
+		})
 	}
 
 	// Обновляем компоненты
@@ -1087,7 +1157,7 @@ func (m model) View() string {
 	sectionStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("#3C3C3C")).
-		Padding(0, 1)
+		Padding(0, 3)
 
 	sectionTitleStyle := lipgloss.NewStyle().
 		Bold(true).
@@ -1242,22 +1312,16 @@ func (m model) View() string {
 	leftSectionWidth := leftColumnWidth - (sectionBorderWidth * 2) - (columnPadding * 2)
 	rightSectionWidth := rightColumnWidth - (sectionBorderWidth * 2) - (columnPadding * 2)
 
-	// Создаем лого Troubadour
-	logoContent := strings.Builder{}
-	logoContent.WriteString("     ♪ ♫ ♪\n")
-	logoContent.WriteString("    /T\\    \n")
-	logoContent.WriteString("   /___\\   \n")
-	logoContent.WriteString("  // | \\\\  \n")
-	logoContent.WriteString(" //__|__\\\\ \n")
-	logoContent.WriteString("    |||    \n")
-	logoContent.WriteString("  ~=====~  \n")
-
+	// Создаем анимированный логотип в рамке
 	logoStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#F5D76E")).
 		Foreground(lipgloss.Color("#F5D76E")).
+		Padding(1, 3).
 		Align(lipgloss.Center).
-		Width(leftColumnWidth - 2)
+		Width(leftColumnWidth - 4)
 
-	logoSection := logoStyle.Render(logoContent.String())
+	logoSection := logoStyle.Render(getAnimatedLogo(m.logoAnimState))
 
 	// Формируем левую колонку
 	// ПРОЦЕССОР
@@ -1481,9 +1545,17 @@ func (m model) View() string {
 			m.sysInfo.SerialNumber, m.userSerial,
 		))
 
+		confetti := []string{
+			"✧･ﾟ: *✧･ﾟ:* \\(^ヮ^)/ *:･ﾟ✧*:･ﾟ✧",
+			"✧*｡٩(ˊᗜˋ*)و✧*｡",
+			"(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧",
+			"(●♡∀♡)",
+		}[m.logoAnimState%4]
+
 		overlayContent = fmt.Sprintf(
-			"%s\n\n%s\n\n%s",
+			"%s\n\n%s\n\n%s\n\n%s",
 			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification Successful"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5D76E")).Render(confetti),
 			successBox,
 			"[B] Return to system information",
 		)
@@ -1494,33 +1566,99 @@ func (m model) View() string {
 			m.sysInfo.SerialNumber, m.userSerial,
 		))
 
+		alert := []string{
+			"(╯°□°）╯︵ ┻━┻",
+			"(ノಠ益ಠ)ノ彡┻━┻",
+			"(∩╹□╹∩)",
+			"(●´⌓`●)",
+		}[m.logoAnimState%4]
+
 		overlayContent = fmt.Sprintf(
-			"%s\n\n%s\n\n%s",
+			"%s\n\n%s\n\n%s\n\n%s",
 			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification Failed"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render(alert),
 			errorBox,
 			"[B] Return to system information",
 		)
 
 	case stateCreateLogs:
+		// Анимация создания логов
+		progressChars := []string{"◐", "◓", "◑", "◒"}
+		progressText := []string{
+			"Hardware information collected",
+			"System verification completed",
+			"dmidecode data parsed",
+			"Writing log file...",
+		}
+
+		progressLines := make([]string, len(progressText))
+		for i, text := range progressText {
+			if i < m.progressAnimState {
+				progressLines[i] = "■ " + text
+			} else if i == m.progressAnimState {
+				progressLines[i] = progressChars[m.logoAnimState%len(progressChars)] + " " + text
+			} else {
+				progressLines[i] = "□ " + text
+			}
+		}
+
 		overlayContent = fmt.Sprintf(
-			"%s\n\n%s\n\n%s\n%s\n%s\n%s\n\n%s",
+			"%s\n\n%s\n\n%s\n\n%s",
 			lipgloss.NewStyle().Bold(true).Render("Log Creation"),
 			"Creating system logs...",
-			"■ Hardware information collected",
-			"■ System verification completed",
-			"■ dmidecode data parsed",
-			"□ Writing log file...",
+			strings.Join(progressLines, "\n"),
 			"[B] Return to system information",
 		)
 
 	case stateDone:
+		// Рассчитываем размер и положение оверлея
+		overlayWidth := m.width / 2
+		if overlayWidth < 50 {
+			overlayWidth = m.width - 10
+		}
+
+		// Создаем красивый вывод содержимого лога
+		logPreview := ""
+		logFile, err := os.ReadFile(m.logFilePath)
+
+		if err == nil {
+			logLines := strings.Split(string(logFile), "\n")
+			// Ограничиваем количество строк для предварительного просмотра
+			previewLines := 10
+			if len(logLines) > previewLines {
+				logLines = logLines[:previewLines]
+				logLines = append(logLines, "... (полный лог сохранен в файле)")
+			}
+
+			logPreview = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#3C3C3C")).
+				Padding(1, 2).
+				Width(overlayWidth - 10).
+				Render(strings.Join(logLines, "\n"))
+		} else {
+			logPreview = "Не удалось прочитать лог-файл: " + err.Error()
+		}
+
+		// Добавляем опции выключения/перезагрузки
+		options := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#EEEEEE")).
+			Render("[E] Выключить систему   [R] Перезагрузить систему   [ENTER] Выход")
+
+		confetti := []string{
+			"✧･ﾟ: *✧･ﾟ:* \\(^ヮ^)/ *:･ﾟ✧*:･ﾟ✧",
+			"✧*｡٩(ˊᗜˋ*)و✧*｡",
+			"(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧",
+			"(●♡∀♡)",
+		}[m.logoAnimState%4]
+
 		overlayContent = fmt.Sprintf(
 			"%s\n\n%s\n\n%s\n\n%s\n\n%s",
-			lipgloss.NewStyle().Bold(true).Render("Log Creation Completed"),
-			"All diagnostics completed successfully.",
+			lipgloss.NewStyle().Bold(true).Render("Diagnostics Completed Successfully"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5D76E")).Render(confetti),
 			fmt.Sprintf("Output file: %s", m.logFilePath),
-			"Press ENTER to exit",
-			"[B] Return to system information",
+			logPreview,
+			options,
 		)
 	}
 
