@@ -1191,7 +1191,6 @@ func (m model) View() string {
 		lipgloss.Center,
 		lipgloss.Center,
 		overlay,
-		lipgloss.curre(baseView),
 	)
 
 	// Если произошла ошибка
