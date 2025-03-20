@@ -3,1557 +3,1232 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"image/color"
 	"io/ioutil"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/disk"
-	"github.com/shirou/gopsutil/mem"
-	"github.com/shirou/gopsutil/net"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-// Структуры для хранения системной информации
+// Структуры для хранения данных системы
 type SystemInfo struct {
-	Processor      ProcessorInfo       `json:"processor"`
-	Memory         MemoryInfo          `json:"memory"`
-	NetworkCards   []NetworkCardInfo   `json:"network_cards"`
-	GPU            GPUInfo             `json:"gpu"`
-	StorageDevices []StorageDeviceInfo `json:"storage_devices"`
-	SerialNumber   string              `json:"serial_number"`
-	TestResults    TestResults         `json:"test_results"`
+	Processor    ProcessorInfo
+	Memory       MemoryInfo
+	Network      []NetworkInfo
+	GPU          GPUInfo
+	Storage      []StorageInfo
+	SerialNumber string
 }
 
 type ProcessorInfo struct {
-	Model        string  `json:"model"`
-	Cores        int     `json:"cores"`
-	Threads      int     `json:"threads"`
-	Frequency    float64 `json:"frequency_mhz"`
-	Cache        string  `json:"cache"`
-	Architecture string  `json:"architecture"`
+	Model     string
+	Cores     int
+	Threads   int
+	Frequency string
+	Cache     map[string]string
 }
 
 type MemoryInfo struct {
-	Total        uint64       `json:"total_bytes"`
-	Slots        []MemorySlot `json:"slots"`
-	Frequency    string       `json:"frequency"`
-	Manufacturer string       `json:"manufacturer"`
+	Total string
+	Slots []MemorySlot
 }
 
 type MemorySlot struct {
-	SlotNumber   int    `json:"slot_number"`
-	Size         uint64 `json:"size_bytes"`
-	Manufacturer string `json:"manufacturer"`
-	Frequency    string `json:"frequency"`
+	ID           string
+	Size         string
+	Type         string
+	Speed        string
+	Manufacturer string
 }
 
-type NetworkCardInfo struct {
-	Name       string `json:"name"`
-	Model      string `json:"model"`
-	MACAddress string `json:"mac_address"`
+type NetworkInfo struct {
+	Interface string
+	Model     string
+	MAC       string
 }
 
 type GPUInfo struct {
-	Model      string `json:"model"`
-	Memory     string `json:"memory"`
-	Resolution string `json:"resolution"`
-	Driver     string `json:"driver"`
+	Model  string
+	Memory string
+	Driver string
 }
 
-type StorageDeviceInfo struct {
-	Type       string `json:"type"` // NVME, SSD, HDD, Flash
-	Model      string `json:"model"`
-	Size       uint64 `json:"size_bytes"`
-	MountPoint string `json:"mount_point,omitempty"`
-	Label      string `json:"label,omitempty"`
+type StorageInfo struct {
+	Type  string // NVMe, SATA, USB, etc.
+	Model string
+	Size  string
+	Label string
 }
 
-type TestResults struct {
-	DisplayTest          bool   `json:"display_test_passed"`
-	SerialNumberVerified bool   `json:"serial_number_verified"`
-	UserEnteredSN        string `json:"user_entered_sn"`
+// Модели для TUI
+type model struct {
+	state           int // Состояние программы
+	sysInfo         SystemInfo
+	width           int
+	height          int
+	textInput       textinput.Model
+	spinner         spinner.Model
+	viewport        viewport.Model
+	err             error
+	userSerial      string
+	dmidecodeRaw    string
+	logFilePath     string
+	showOverlay     bool      // Показывать ли наложение
+	overlayContent  string    // Содержимое наложения
+	videoTestActive bool      // Активен ли видеотест
+	videoTestColor  int       // Текущий цвет видеотеста (0-red, 1-green, 2-blue)
+	videoTestStart  time.Time // Время начала видеотеста
 }
 
-// Глобальные переменные
-var sysInfo SystemInfo
-var currentWindow fyne.Window
-var mainApp fyne.App
-var statusLabel *widget.Label
+// Состояния программы
+const (
+	stateInit = iota
+	stateShowInfo
+	stateVideoTest
+	stateAskVideoOk
+	stateAskSerial
+	stateCheckSerial
+	stateSerialError
+	stateCreateLogs
+	stateDone
+)
 
-func main() {
-	// Инициализация приложения
-	myApp := app.New()
-	myApp.Settings().SetTheme(NewTroubadourTheme())
-	mainApp = myApp
-	window := myApp.NewWindow("Troubadour")
-	currentWindow = window
-	window.Resize(fyne.NewSize(1200, 800))
-	window.SetPadded(true)
+func initialModel() model {
+	ti := textinput.New()
+	ti.Placeholder = "Введите серийный номер"
+	ti.Focus()
+	ti.CharLimit = 30
+	ti.Width = 30
 
-	// Запуск последовательности действий
-	startDiagnosticSequence(window)
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
-	window.ShowAndRun()
-}
+	vp := viewport.New(80, 20)
 
-// TroubadourTheme - кастомная тема для приложения
-type TroubadourTheme struct {
-	fyne.Theme
-}
-
-func NewTroubadourTheme() fyne.Theme {
-	return &TroubadourTheme{Theme: theme.DefaultTheme()}
-}
-
-func (t *TroubadourTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
-	switch name {
-	case theme.ColorNameBackground:
-		return color.NRGBA{30, 30, 46, 255} // #1E1E2E
-	case theme.ColorNameForeground:
-		return color.NRGBA{205, 214, 244, 255} // #CDD6F4
-	case theme.ColorNamePrimary:
-		return color.NRGBA{137, 180, 250, 255} // #89B4FA
-	case theme.ColorNameButton:
-		return color.NRGBA{69, 71, 90, 255} // #45475A
-	case theme.ColorNameDisabled:
-		return color.NRGBA{127, 132, 156, 255} // #7F849C
-	default:
-		return t.Theme.Color(name, variant)
+	return model{
+		state:          stateInit,
+		textInput:      ti,
+		spinner:        s,
+		viewport:       vp,
+		showOverlay:    false,
+		videoTestColor: 0,
 	}
 }
 
-// Функция для запуска последовательности диагностики
-func startDiagnosticSequence(window fyne.Window) {
-	// Показываем заставку
-	showSplashScreen(window, "Инициализация Troubadour...", func() {
-		// 1. Сбор системной информации
-		collectSystemInformation()
-
-		// 2. Отображение собранной информации
-		showSystemInfo(window)
-
-		// 3-5 Последующие этапы вызываются автоматически в конце каждого предыдущего
-	})
-}
-
-// Показать заставку
-func showSplashScreen(window fyne.Window, message string, onComplete func()) {
-	title := canvas.NewText("Troubadour", color.NRGBA{205, 214, 244, 255})
-	title.TextSize = 36
-	title.Alignment = fyne.TextAlignCenter
-
-	subtitle := canvas.NewText("Системная диагностика", color.NRGBA{166, 173, 200, 255})
-	subtitle.TextSize = 20
-	subtitle.Alignment = fyne.TextAlignCenter
-
-	progress := widget.NewProgressBarInfinite()
-
-	status := widget.NewLabel(message)
-	status.Alignment = fyne.TextAlignCenter
-
-	content := container.NewVBox(
-		layout.NewSpacer(),
-		title,
-		subtitle,
-		container.NewPadded(
-			container.NewVBox(
-				layout.NewSpacer(),
-				progress,
-				status,
-				layout.NewSpacer(),
-			),
-		),
-		layout.NewSpacer(),
+func (m model) Init() tea.Cmd {
+	// Проверяем root и начинаем сбор данных
+	return tea.Batch(
+		checkRootCmd,
+		spinner.Tick,
+		collectSystemInfoCmd,
 	)
-
-	window.SetContent(content)
-
-	// Выполняем функцию через небольшую задержку
-	go func() {
-		time.Sleep(1 * time.Second)
-		onComplete()
-	}()
 }
 
-// Функция для сбора системной информации
-func collectSystemInformation() {
-	// Инициализация результатов тестов
-	sysInfo.TestResults = TestResults{}
-
-	// Сбор информации о компонентах системы
-	collectProcessorInfo()
-	collectMemoryInfo()
-	collectNetworkInfo()
-	collectGPUInfo()
-	collectStorageInfo()
-	collectSerialNumber()
+// Команда для проверки root прав
+func checkRootCmd() tea.Msg {
+	if os.Geteuid() != 0 {
+		return errMsg{error: fmt.Errorf("эта программа должна быть запущена с правами root")}
+	}
+	return nil
 }
 
-// Функция для сбора информации о процессоре
-func collectProcessorInfo() {
-	cpuInfo, err := cpu.Info()
+type errMsg struct {
+	error
+}
+
+// Команды для сбора системной информации
+func collectSystemInfoCmd() tea.Msg {
+	sysInfo := SystemInfo{}
+	var err error
+
+	// Получение информации о процессоре
+	sysInfo.Processor, err = getProcessorInfo()
 	if err != nil {
-		fmt.Println("Error fetching CPU info:", err)
-		return
+		return errMsg{err}
 	}
 
-	if len(cpuInfo) > 0 {
-		cpu := cpuInfo[0]
-		sysInfo.Processor = ProcessorInfo{
-			Model:        cpu.ModelName,
-			Cores:        int(cpu.Cores),
-			Threads:      len(cpuInfo),
-			Frequency:    cpu.Mhz,
-			Cache:        fmt.Sprintf("L2: %.1f MB", float64(cpu.CacheSize)/1024),
-			Architecture: cpu.ModelName,
-		}
+	// Получение информации о памяти
+	sysInfo.Memory, err = getMemoryInfo()
+	if err != nil {
+		return errMsg{err}
 	}
 
-	// Дополнительная информация через dmidecode
-	cmd := exec.Command("dmidecode", "-t", "processor")
-	output, err := cmd.Output()
+	// Получение информации о сетевых картах
+	sysInfo.Network, err = getNetworkInfo()
+	if err != nil {
+		return errMsg{err}
+	}
+
+	// Получение информации о GPU
+	sysInfo.GPU, err = getGPUInfo()
+	if err != nil {
+		return errMsg{err}
+	}
+
+	// Получение информации о накопителях
+	sysInfo.Storage, err = getStorageInfo()
+	if err != nil {
+		return errMsg{err}
+	}
+
+	// Получение серийного номера из dmidecode
+	dmidecodeRaw, err := execCommand("dmidecode", "-t", "system")
+	if err != nil {
+		return errMsg{err}
+	}
+
+	re := regexp.MustCompile(`Serial Number:\s*(.+)`)
+	matches := re.FindStringSubmatch(dmidecodeRaw)
+	if len(matches) > 1 {
+		sysInfo.SerialNumber = strings.TrimSpace(matches[1])
+	}
+
+	return sysInfoCollectedMsg{
+		sysInfo:      sysInfo,
+		dmidecodeRaw: dmidecodeRaw,
+	}
+}
+
+type sysInfoCollectedMsg struct {
+	sysInfo      SystemInfo
+	dmidecodeRaw string
+}
+
+// Функции сбора данных о системе
+func getProcessorInfo() (ProcessorInfo, error) {
+	var info ProcessorInfo
+
+	// Получаем информацию из /proc/cpuinfo
+	cpuinfo, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return info, err
+	}
+
+	// Получаем модель процессора
+	modelRegex := regexp.MustCompile(`model name\s*:\s*(.+)`)
+	model := modelRegex.FindSubmatch(cpuinfo)
+	if len(model) > 1 {
+		info.Model = strings.TrimSpace(string(model[1]))
+	}
+
+	// Получаем количество физических ядер
+	physicalCoresCmd := exec.Command("sh", "-c", "grep 'cpu cores' /proc/cpuinfo | uniq | awk '{print $4}'")
+	physicalCoresOutput, err := physicalCoresCmd.Output()
 	if err == nil {
-		outputStr := string(output)
-		lines := strings.Split(outputStr, "\n")
-
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-
-			if strings.HasPrefix(line, "Version:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 2 && sysInfo.Processor.Model == "" {
-					sysInfo.Processor.Model = strings.TrimSpace(parts[1])
-				}
-			} else if strings.HasPrefix(line, "Core Count:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 2 && sysInfo.Processor.Cores == 0 {
-					fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &sysInfo.Processor.Cores)
-				}
-			} else if strings.HasPrefix(line, "Thread Count:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 2 && sysInfo.Processor.Threads == 0 {
-					fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &sysInfo.Processor.Threads)
-				}
-			} else if strings.HasPrefix(line, "External Clock:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 2 && sysInfo.Processor.Frequency == 0 {
-					var freq float64
-					fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &freq)
-					sysInfo.Processor.Frequency = freq
-				}
-			} else if strings.HasPrefix(line, "Max Speed:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 2 && sysInfo.Processor.Frequency == 0 {
-					var freq float64
-					fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &freq)
-					sysInfo.Processor.Frequency = freq
-				}
-			} else if strings.HasPrefix(line, "Family:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 2 {
-					sysInfo.Processor.Architecture = strings.TrimSpace(parts[1])
-				}
-			}
-		}
+		info.Cores, _ = strconv.Atoi(strings.TrimSpace(string(physicalCoresOutput)))
 	}
 
-	// Если какие-то поля не заполнены, пробуем получить информацию через lscpu
-	if sysInfo.Processor.Model == "" || sysInfo.Processor.Cores == 0 || sysInfo.Processor.Frequency == 0 {
-		cmd := exec.Command("lscpu")
-		output, err := cmd.Output()
+	// Если не удалось получить количество ядер, считаем уникальные physical id
+	if info.Cores == 0 {
+		physicalCoresCmd = exec.Command("sh", "-c", "cat /proc/cpuinfo | grep 'physical id' | sort -u | wc -l")
+		physicalCoresOutput, err := physicalCoresCmd.Output()
 		if err == nil {
-			outputStr := string(output)
-			lines := strings.Split(outputStr, "\n")
-
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-
-				if strings.HasPrefix(line, "Model name:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 && sysInfo.Processor.Model == "" {
-						sysInfo.Processor.Model = strings.TrimSpace(parts[1])
-					}
-				} else if strings.HasPrefix(line, "CPU(s):") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 && sysInfo.Processor.Threads == 0 {
-						fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &sysInfo.Processor.Threads)
-					}
-				} else if strings.HasPrefix(line, "Core(s) per socket:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 && sysInfo.Processor.Cores == 0 {
-						var coresPerSocket int
-						fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &coresPerSocket)
-
-						// Нужно умножить на количество сокетов
-						sockets := 1
-						for _, l := range lines {
-							if strings.HasPrefix(l, "Socket(s):") {
-								parts := strings.SplitN(l, ":", 2)
-								if len(parts) >= 2 {
-									fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &sockets)
-									break
-								}
-							}
-						}
-
-						sysInfo.Processor.Cores = coresPerSocket * sockets
-					}
-				} else if strings.HasPrefix(line, "CPU MHz:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 && sysInfo.Processor.Frequency == 0 {
-						fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &sysInfo.Processor.Frequency)
-					}
-				} else if strings.HasPrefix(line, "Architecture:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 && sysInfo.Processor.Architecture == "" {
-						sysInfo.Processor.Architecture = strings.TrimSpace(parts[1])
-					}
-				} else if strings.HasPrefix(line, "L2 cache:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 {
-						sysInfo.Processor.Cache = strings.TrimSpace(parts[1])
-					}
-				}
-			}
+			info.Cores, _ = strconv.Atoi(strings.TrimSpace(string(physicalCoresOutput)))
 		}
 	}
-}
 
-// Функция для сбора информации о памяти
-func collectMemoryInfo() {
-	memInfo, err := mem.VirtualMemory()
-	if err != nil {
-		fmt.Println("Error fetching memory info:", err)
-		return
-	}
-
-	memoryInfo := MemoryInfo{
-		Total: memInfo.Total,
-		Slots: []MemorySlot{},
-	}
-
-	// Используем dmidecode для получения детальной информации о памяти
-	cmd := exec.Command("dmidecode", "-t", "memory")
-	output, err := cmd.Output()
+	// Получаем количество логических ядер
+	threadsCmd := exec.Command("sh", "-c", "cat /proc/cpuinfo | grep processor | wc -l")
+	threadsOutput, err := threadsCmd.Output()
 	if err == nil {
-		outputStr := string(output)
-		lines := strings.Split(outputStr, "\n")
+		info.Threads, _ = strconv.Atoi(strings.TrimSpace(string(threadsOutput)))
+	}
 
-		var currentSlot *MemorySlot
-		slotNumber := 0
-
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-
-			if strings.Contains(line, "Memory Device") {
-				if currentSlot != nil && currentSlot.Size > 0 {
-					memoryInfo.Slots = append(memoryInfo.Slots, *currentSlot)
-				}
-
-				slotNumber++
-				currentSlot = &MemorySlot{SlotNumber: slotNumber}
-			}
-
-			if currentSlot != nil {
-				if strings.HasPrefix(line, "Size:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 {
-						sizeStr := strings.TrimSpace(parts[1])
-
-						if strings.Contains(sizeStr, "No Module Installed") {
-							currentSlot = nil // Пропускаем пустой слот
-							continue
-						}
-
-						size := uint64(0)
-						unit := ""
-						fmt.Sscanf(sizeStr, "%d %s", &size, &unit)
-
-						// Конвертируем в байты
-						if strings.Contains(unit, "GB") {
-							size *= 1024 * 1024 * 1024
-						} else if strings.Contains(unit, "MB") {
-							size *= 1024 * 1024
-						} else if strings.Contains(unit, "KB") {
-							size *= 1024
-						}
-
-						currentSlot.Size = size
-					}
-				} else if strings.HasPrefix(line, "Manufacturer:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 {
-						manufacturer := strings.TrimSpace(parts[1])
-						currentSlot.Manufacturer = manufacturer
-
-						// Используем производителя первого слота как общий
-						if memoryInfo.Manufacturer == "" && manufacturer != "" {
-							memoryInfo.Manufacturer = manufacturer
-						}
-					}
-				} else if strings.HasPrefix(line, "Speed:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 {
-						freq := strings.TrimSpace(parts[1])
-						if freq != "Unknown" && freq != "" {
-							currentSlot.Frequency = freq
-
-							// Используем частоту первого слота как общую
-							if memoryInfo.Frequency == "" {
-								memoryInfo.Frequency = freq
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Добавляем последний слот
-		if currentSlot != nil && currentSlot.Size > 0 {
-			memoryInfo.Slots = append(memoryInfo.Slots, *currentSlot)
+	// Получаем частоту
+	freqCmd := exec.Command("sh", "-c", "lscpu | grep 'CPU MHz' | awk '{print $3}'")
+	freqOutput, err := freqCmd.Output()
+	if err == nil {
+		freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(string(freqOutput)), 64)
+		info.Frequency = fmt.Sprintf("%.1f GHz", freqMHz/1000.0)
+	} else {
+		// Если не удалось получить из lscpu, пробуем получить из cpuinfo
+		freqRegex := regexp.MustCompile(`cpu MHz\s*:\s*(.+)`)
+		freq := freqRegex.FindSubmatch(cpuinfo)
+		if len(freq) > 1 {
+			freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(string(freq[1])), 64)
+			info.Frequency = fmt.Sprintf("%.1f GHz", freqMHz/1000.0)
 		}
 	}
 
-	sysInfo.Memory = memoryInfo
+	// Получаем информацию о кэше
+	info.Cache = make(map[string]string)
+
+	// L1 кэш
+	l1dCacheCmd := exec.Command("sh", "-c", "lscpu | grep 'L1d cache' | awk '{print $3, $4}'")
+	l1dCacheOutput, _ := l1dCacheCmd.Output()
+	l1iCacheCmd := exec.Command("sh", "-c", "lscpu | grep 'L1i cache' | awk '{print $3, $4}'")
+	l1iCacheOutput, _ := l1iCacheCmd.Output()
+
+	if len(l1dCacheOutput) > 0 && len(l1iCacheOutput) > 0 {
+		info.Cache["L1"] = strings.TrimSpace(string(l1dCacheOutput))
+	}
+
+	// L2 кэш
+	l2CacheCmd := exec.Command("sh", "-c", "lscpu | grep 'L2 cache' | awk '{print $3, $4}'")
+	l2CacheOutput, _ := l2CacheCmd.Output()
+	if len(l2CacheOutput) > 0 {
+		info.Cache["L2"] = strings.TrimSpace(string(l2CacheOutput))
+	}
+
+	// L3 кэш
+	l3CacheCmd := exec.Command("sh", "-c", "lscpu | grep 'L3 cache' | awk '{print $3, $4}'")
+	l3CacheOutput, _ := l3CacheCmd.Output()
+	if len(l3CacheOutput) > 0 {
+		info.Cache["L3"] = strings.TrimSpace(string(l3CacheOutput))
+	}
+
+	return info, nil
 }
 
-// Функция для сбора информации о сетевых картах
-func collectNetworkInfo() {
-	interfaces, err := net.Interfaces()
+func getMemoryInfo() (MemoryInfo, error) {
+	var info MemoryInfo
+
+	// Получаем общий объем памяти
+	meminfo, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		fmt.Println("Error fetching network interfaces:", err)
-		return
+		return info, err
 	}
 
-	var networkCards []NetworkCardInfo
+	totalRegex := regexp.MustCompile(`MemTotal:\s*(\d+)`)
+	total := totalRegex.FindSubmatch(meminfo)
+	if len(total) > 1 {
+		totalKB, _ := strconv.ParseInt(string(total[1]), 10, 64)
+		info.Total = fmt.Sprintf("%d GB", totalKB/1024/1024)
+	}
 
-	for _, iface := range interfaces {
-		// Пропускаем неактивные и локальные интерфейсы
-		var isUp, isLoopback bool
-		for _, flag := range iface.Flags {
-			if flag == "up" {
-				isUp = true
-			}
-			if flag == "loopback" {
-				isLoopback = true
-			}
-		}
+	// Получаем информацию о слотах памяти из dmidecode
+	output, err := execCommand("dmidecode", "-t", "memory")
+	if err != nil {
+		return info, err
+	}
 
-		if !isUp || isLoopback {
+	// Разделяем вывод на блоки Memory Device
+	blocks := strings.Split(output, "Memory Device")
+
+	for i, block := range blocks {
+		if i == 0 { // Пропускаем заголовок
 			continue
 		}
 
-		// Базовая информация
-		card := NetworkCardInfo{
-			Name:       iface.Name,
-			MACAddress: iface.HardwareAddr,
+		// Проверяем есть ли модуль в слоте
+		if strings.Contains(block, "No Module Installed") {
+			continue
 		}
 
-		// Пытаемся получить модель через lshw
-		modelFound := false
-		cmd := exec.Command("lshw", "-class", "network", "-short")
-		output, err := cmd.Output()
-		if err == nil {
-			outputStr := string(output)
-			lines := strings.Split(outputStr, "\n")
-
-			for _, line := range lines {
-				if strings.Contains(line, iface.Name) {
-					parts := strings.Fields(line)
-					if len(parts) > 1 {
-						// Модель - это все оставшиеся поля
-						card.Model = strings.Join(parts[1:], " ")
-						modelFound = true
-						break
-					}
-				}
+		// Размер
+		sizeRegex := regexp.MustCompile(`Size: ([^\n]+)`)
+		size := sizeRegex.FindStringSubmatch(block)
+		if len(size) > 1 && !strings.Contains(size[1], "No Module Installed") {
+			slot := MemorySlot{
+				ID:   fmt.Sprintf("%d", i),
+				Size: strings.TrimSpace(size[1]),
 			}
-		}
 
-		// Если модель не найдена, попробуем другой подход
-		if !modelFound {
-			cmd := exec.Command("ethtool", "-i", iface.Name)
-			output, err := cmd.Output()
-			if err == nil {
-				outputStr := string(output)
-				lines := strings.Split(outputStr, "\n")
-
-				for _, line := range lines {
-					if strings.HasPrefix(line, "driver:") || strings.HasPrefix(line, "version:") {
-						parts := strings.SplitN(line, ":", 2)
-						if len(parts) >= 2 {
-							info := strings.TrimSpace(parts[1])
-							if card.Model == "" {
-								card.Model = info
-							} else {
-								card.Model += " " + info
-							}
-						}
-					}
-				}
+			// Тип памяти
+			typeRegex := regexp.MustCompile(`Type: ([^\n]+)`)
+			typeMatch := typeRegex.FindStringSubmatch(block)
+			if len(typeMatch) > 1 {
+				slot.Type = strings.TrimSpace(typeMatch[1])
 			}
-		}
 
-		// Добавляем только если у нас есть MAC адрес
-		if card.MACAddress != "" {
-			networkCards = append(networkCards, card)
+			// Скорость
+			speedRegex := regexp.MustCompile(`Speed: ([^\n]+)`)
+			speedMatch := speedRegex.FindStringSubmatch(block)
+			if len(speedMatch) > 1 {
+				slot.Speed = strings.TrimSpace(speedMatch[1])
+			}
+
+			// Производитель
+			mfgRegex := regexp.MustCompile(`Manufacturer: ([^\n]+)`)
+			mfgMatch := mfgRegex.FindStringSubmatch(block)
+			if len(mfgMatch) > 1 {
+				slot.Manufacturer = strings.TrimSpace(mfgMatch[1])
+			}
+
+			info.Slots = append(info.Slots, slot)
 		}
 	}
 
-	sysInfo.NetworkCards = networkCards
+	return info, nil
 }
 
-// Функция для сбора информации о GPU
-func collectGPUInfo() {
-	gpu := GPUInfo{}
+func getNetworkInfo() ([]NetworkInfo, error) {
+	var interfaces []NetworkInfo
 
-	// Пробуем lspci
-	cmd := exec.Command("lspci", "-v")
-	output, err := cmd.Output()
-	if err == nil {
-		outputStr := string(output)
-		lines := strings.Split(outputStr, "\n")
+	// Получаем список сетевых интерфейсов
+	netDir := "/sys/class/net/"
+	files, err := ioutil.ReadDir(netDir)
+	if err != nil {
+		return interfaces, err
+	}
 
-		for i, line := range lines {
-			if strings.Contains(line, "VGA compatible controller") || strings.Contains(line, "3D controller") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 2 {
-					gpu.Model = strings.TrimSpace(parts[1])
+	for _, file := range files {
+		ifName := file.Name()
+		if ifName == "lo" {
+			continue // Пропускаем локальный интерфейс
+		}
 
-					// Ищем дополнительную информацию в следующих строках
-					for j := i + 1; j < len(lines) && j < i+15; j++ {
-						subline := strings.TrimSpace(lines[j])
+		netInfo := NetworkInfo{
+			Interface: ifName,
+		}
 
-						if strings.Contains(subline, "Memory") {
-							gpu.Memory = subline
-						} else if strings.Contains(subline, "Kernel driver") || strings.Contains(subline, "Kernel modules") {
-							if gpu.Driver == "" {
-								gpu.Driver = subline
-							}
+		// Получаем MAC адрес
+		macBytes, err := ioutil.ReadFile(filepath.Join(netDir, ifName, "address"))
+		if err == nil {
+			netInfo.MAC = strings.TrimSpace(string(macBytes))
+		}
+
+		// Получаем модель/производителя
+		modelCmd := exec.Command("sh", "-c", fmt.Sprintf("lspci | grep -i net | grep -v 'virtual' | head -1 | cut -d: -f3"))
+		modelOutput, err := modelCmd.Output()
+		if err == nil && len(modelOutput) > 0 {
+			netInfo.Model = strings.TrimSpace(string(modelOutput))
+		} else {
+			// Пробуем другой метод
+			ethtoolCmd := exec.Command("ethtool", "-i", ifName)
+			ethtoolOutput, err := ethtoolCmd.Output()
+			if err == nil {
+				lines := strings.Split(string(ethtoolOutput), "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "driver:") {
+						parts := strings.SplitN(line, ":", 2)
+						if len(parts) > 1 {
+							netInfo.Model = strings.TrimSpace(parts[1])
 						}
 					}
+				}
+			}
+		}
 
+		// Если не удалось получить модель, используем IP link
+		if netInfo.Model == "" {
+			ipLinkCmd := exec.Command("ip", "link", "show", ifName)
+			_, err := ipLinkCmd.Output()
+			if err == nil {
+				netInfo.Model = "Network Interface"
+			}
+		}
+
+		interfaces = append(interfaces, netInfo)
+	}
+
+	return interfaces, nil
+}
+
+func getGPUInfo() (GPUInfo, error) {
+	var info GPUInfo
+
+	// Пробуем использовать lspci для получения информации о GPU
+	cmd := exec.Command("sh", "-c", "lspci | grep -i 'vga\\|3d\\|2d'")
+	output, err := cmd.Output()
+	if err == nil && len(output) > 0 {
+		info.Model = strings.TrimSpace(string(output))
+
+		// Пробуем получить более подробную информацию с помощью различных инструментов
+
+		// Пробуем nvidia-smi для NVIDIA карт
+		nvidiaCmd := exec.Command("sh", "-c", "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
+		nvidiaOutput, err := nvidiaCmd.Output()
+		if err == nil && len(nvidiaOutput) > 0 {
+			parts := strings.Split(string(nvidiaOutput), ",")
+			if len(parts) >= 2 {
+				info.Model = strings.TrimSpace(parts[0])
+				info.Memory = strings.TrimSpace(parts[1])
+
+				// Получаем версию драйвера
+				driverCmd := exec.Command("sh", "-c", "nvidia-smi --query-gpu=driver_version --format=csv,noheader")
+				driverOutput, err := driverCmd.Output()
+				if err == nil && len(driverOutput) > 0 {
+					info.Driver = fmt.Sprintf("NVIDIA %s", strings.TrimSpace(string(driverOutput)))
+				}
+			}
+		} else {
+			// Пробуем для AMD карт
+			amdCmd := exec.Command("sh", "-c", "glxinfo | grep 'OpenGL renderer'")
+			amdOutput, err := amdCmd.Output()
+			if err == nil && len(amdOutput) > 0 {
+				rendererRegex := regexp.MustCompile(`OpenGL renderer string: (.+)`)
+				match := rendererRegex.FindStringSubmatch(string(amdOutput))
+				if len(match) > 1 {
+					info.Model = match[1]
+
+					// Получаем версию драйвера
+					versionCmd := exec.Command("sh", "-c", "glxinfo | grep 'OpenGL version'")
+					versionOutput, err := versionCmd.Output()
+					if err == nil && len(versionOutput) > 0 {
+						versionRegex := regexp.MustCompile(`OpenGL version string: (.+)`)
+						match := versionRegex.FindStringSubmatch(string(versionOutput))
+						if len(match) > 1 {
+							info.Driver = match[1]
+						}
+					}
+				}
+			} else {
+				// Проверяем Intel Graphics
+				intelCmd := exec.Command("sh", "-c", "lspci | grep -i 'vga' | grep -i 'intel'")
+				intelOutput, err := intelCmd.Output()
+				if err == nil && len(intelOutput) > 0 {
+					info.Model = "Intel Integrated Graphics"
+
+					// Пытаемся получить версию драйвера
+					driverCmd := exec.Command("sh", "-c", "glxinfo | grep 'OpenGL version'")
+					driverOutput, err := driverCmd.Output()
+					if err == nil && len(driverOutput) > 0 {
+						info.Driver = string(driverOutput)
+					}
+				}
+			}
+		}
+	}
+
+	return info, nil
+}
+
+func getStorageInfo() ([]StorageInfo, error) {
+	var storageDevices []StorageInfo
+
+	// Используем lsblk для получения информации о дисках
+	cmd := exec.Command("sh", "-c", "lsblk -o NAME,SIZE,TYPE,MODEL,MOUNTPOINT,LABEL -J")
+	output, err := cmd.Output()
+	if err != nil {
+		// Попробуем альтернативный вариант без -J (JSON форматирования)
+		cmd = exec.Command("sh", "-c", "lsblk -o NAME,SIZE,TYPE,MODEL,MOUNTPOINT,LABEL")
+		output, err = cmd.Output()
+		if err != nil {
+			return storageDevices, err
+		}
+
+		// Парсим текстовый вывод lsblk
+		lines := strings.Split(string(output), "\n")
+		if len(lines) > 1 { // Пропускаем заголовок
+			for i := 1; i < len(lines); i++ {
+				fields := strings.Fields(lines[i])
+				if len(fields) >= 3 && fields[2] == "disk" {
+					device := StorageInfo{
+						Type: "SATA/IDE",
+						Size: fields[1],
+					}
+
+					if len(fields) >= 4 {
+						device.Model = fields[3]
+					}
+
+					if strings.HasPrefix(fields[0], "nvme") {
+						device.Type = "NVMe"
+					} else if strings.HasPrefix(fields[0], "sd") {
+						// Проверяем, USB это или SATA
+						symlinkPath := fmt.Sprintf("/sys/block/%s", fields[0])
+						realPath, err := filepath.EvalSymlinks(symlinkPath)
+						if err == nil {
+							if strings.Contains(realPath, "usb") {
+								device.Type = "USB"
+							}
+						}
+					} else if strings.HasPrefix(fields[0], "mmcblk") {
+						device.Type = "SD/MMC"
+					}
+
+					// Ищем метку в выводе lsblk
+					if len(fields) >= 6 {
+						device.Label = fields[5]
+					}
+
+					storageDevices = append(storageDevices, device)
+				}
+			}
+		}
+
+		return storageDevices, nil
+	}
+
+	// Парсим JSON от lsblk
+	var lsblkOutput struct {
+		Blockdevices []struct {
+			Name       string `json:"name"`
+			Size       string `json:"size"`
+			Type       string `json:"type"`
+			Model      string `json:"model"`
+			Mountpoint string `json:"mountpoint"`
+			Label      string `json:"label"`
+			Children   []struct {
+				Name       string `json:"name"`
+				Size       string `json:"size"`
+				Type       string `json:"type"`
+				Mountpoint string `json:"mountpoint"`
+				Label      string `json:"label"`
+			} `json:"children,omitempty"`
+		} `json:"blockdevices"`
+	}
+
+	err = json.Unmarshal(output, &lsblkOutput)
+	if err != nil {
+		return storageDevices, err
+	}
+
+	// Обрабатываем полученные данные
+	for _, device := range lsblkOutput.Blockdevices {
+		if device.Type == "disk" || device.Type == "rom" {
+			storageType := "SATA/IDE"
+
+			// Определяем тип устройства (NVMe, USB, и т.д.)
+			if strings.HasPrefix(device.Name, "nvme") {
+				storageType = "NVMe"
+			} else if strings.HasPrefix(device.Name, "sd") {
+				// Проверяем, USB это или SATA
+				symlinkPath := fmt.Sprintf("/sys/block/%s", device.Name)
+				realPath, err := filepath.EvalSymlinks(symlinkPath)
+				if err == nil {
+					if strings.Contains(realPath, "usb") {
+						storageType = "USB"
+					}
+				}
+			} else if strings.HasPrefix(device.Name, "mmcblk") {
+				storageType = "SD/MMC"
+			}
+
+			storage := StorageInfo{
+				Type:  storageType,
+				Model: device.Model,
+				Size:  device.Size,
+			}
+
+			// Ищем метку в разделах, если она есть
+			for _, partition := range device.Children {
+				if partition.Label != "" {
+					storage.Label = partition.Label
 					break
 				}
 			}
+
+			storageDevices = append(storageDevices, storage)
 		}
 	}
 
-	// Получаем информацию о разрешении с помощью xrandr
-	cmd = exec.Command("xrandr")
-	output, err = cmd.Output()
-	if err == nil {
-		outputStr := string(output)
-		lines := strings.Split(outputStr, "\n")
-
-		for _, line := range lines {
-			if strings.Contains(line, " connected ") {
-				parts := strings.Fields(line)
-				for _, part := range parts {
-					if strings.Contains(part, "x") && strings.Contains(part, "+") {
-						// Формат вывода xrandr: 1920x1080+0+0
-						resolution := strings.Split(part, "+")[0]
-						gpu.Resolution = resolution
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// Если модель не найдена, пробуем glxinfo
-	if gpu.Model == "" {
-		cmd := exec.Command("glxinfo")
-		output, err := cmd.Output()
-		if err == nil {
-			outputStr := string(output)
-			lines := strings.Split(outputStr, "\n")
-
-			for _, line := range lines {
-				if strings.Contains(line, "OpenGL renderer string") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 {
-						gpu.Model = strings.TrimSpace(parts[1])
-					}
-				} else if strings.Contains(line, "Video memory") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 {
-						gpu.Memory = strings.TrimSpace(parts[1])
-					}
-				} else if strings.Contains(line, "OpenGL version string") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) >= 2 {
-						gpu.Driver = strings.TrimSpace(parts[1])
-					}
-				}
-			}
-		}
-	}
-
-	sysInfo.GPU = gpu
+	return storageDevices, nil
 }
 
-// Функция для сбора информации о носителях
-func collectStorageInfo() {
-	var storageDevices []StorageDeviceInfo
-
-	// Получаем список разделов
-	partitions, err := disk.Partitions(true)
+// Вспомогательная функция для выполнения команд
+func execCommand(command string, args ...string) (string, error) {
+	cmd := exec.Command(command, args...)
+	output, err := cmd.CombinedOutput() // Объединяем stdout и stderr
 	if err != nil {
-		fmt.Println("Error fetching partitions:", err)
-		return
+		return "", fmt.Errorf("ошибка выполнения команды %s: %v\nВывод: %s", command, err, string(output))
 	}
-
-	// Хранит основные устройства, чтобы не добавлять их несколько раз
-	processedDevices := make(map[string]bool)
-
-	for _, partition := range partitions {
-		devicePath := partition.Device
-
-		// Получаем базовое устройство (без номера раздела)
-		baseDevice := devicePath
-		for i := len(devicePath) - 1; i >= 0; i-- {
-			if devicePath[i] < '0' || devicePath[i] > '9' {
-				baseDevice = devicePath[:i+1]
-				break
-			}
-		}
-
-		// Пропускаем, если уже обработали это устройство
-		if _, exists := processedDevices[baseDevice]; exists {
-			continue
-		}
-		processedDevices[baseDevice] = true
-
-		// Начинаем заполнять информацию об устройстве
-		device := StorageDeviceInfo{
-			MountPoint: partition.Mountpoint,
-		}
-
-		// Определяем тип устройства
-		if strings.Contains(baseDevice, "nvme") {
-			device.Type = "NVME"
-		} else if strings.Contains(baseDevice, "sd") {
-			// Определяем SSD или HDD
-			if isSSD(baseDevice) {
-				device.Type = "SSD"
-			} else {
-				device.Type = "HDD"
-			}
-		} else if strings.Contains(baseDevice, "mmcblk") {
-			device.Type = "Flash"
-		} else {
-			device.Type = "Other"
-		}
-
-		// Получаем размер устройства
-		cmd := exec.Command("lsblk", "-b", "-d", "-n", "-o", "SIZE", baseDevice)
-		output, err := cmd.Output()
-		if err == nil {
-			sizeStr := strings.TrimSpace(string(output))
-			var size uint64
-			fmt.Sscanf(sizeStr, "%d", &size)
-			device.Size = size
-		}
-
-		// Получаем модель устройства
-		cmd = exec.Command("lsblk", "-d", "-n", "-o", "MODEL", baseDevice)
-		output, err = cmd.Output()
-		if err == nil {
-			device.Model = strings.TrimSpace(string(output))
-		}
-
-		// Получаем метку тома
-		cmd = exec.Command("lsblk", "-n", "-o", "LABEL", devicePath)
-		output, err = cmd.Output()
-		if err == nil {
-			device.Label = strings.TrimSpace(string(output))
-		}
-
-		// Добавляем устройство в список, если знаем его размер
-		if device.Size > 0 {
-			storageDevices = append(storageDevices, device)
-		}
-	}
-
-	sysInfo.StorageDevices = storageDevices
+	return string(output), nil
 }
 
-// Определяет, является ли устройство SSD
-func isSSD(devicePath string) bool {
-	// Извлекаем только имя устройства без пути
-	deviceName := filepath.Base(devicePath)
-
-	// Проверяем через rotational параметр
-	cmd := exec.Command("cat", fmt.Sprintf("/sys/block/%s/queue/rotational", deviceName))
-	output, err := cmd.Output()
-	if err == nil {
-		// 0 означает невращающееся устройство (SSD), 1 - вращающееся (HDD)
-		return strings.TrimSpace(string(output)) == "0"
-	}
-
-	return false
+// Команда для запуска видео теста в терминале (без ffplay)
+func startVideoTestCmd() tea.Msg {
+	return startVideoTestMsg{}
 }
 
-// Функция для получения серийного номера системы
-func collectSerialNumber() {
-	// Получаем серийный номер через dmidecode
-	cmd := exec.Command("dmidecode", "-s", "system-serial-number")
-	output, err := cmd.Output()
-	if err == nil {
-		sn := strings.TrimSpace(string(output))
-		// Проверяем, что не получили "Not Specified" или другое проблемное значение
-		if sn != "" && sn != "Not Specified" && sn != "System Serial Number" && sn != "To be filled by O.E.M." {
-			sysInfo.SerialNumber = sn
-			return
-		}
-	}
+type startVideoTestMsg struct{}
 
-	// Если не удалось получить через dmidecode, пробуем альтернативные методы
-	// Проверяем базовую плату
-	cmd = exec.Command("dmidecode", "-s", "baseboard-serial-number")
-	output, err = cmd.Output()
-	if err == nil {
-		sn := strings.TrimSpace(string(output))
-		if sn != "" && sn != "Not Specified" && sn != "To be filled by O.E.M." {
-			sysInfo.SerialNumber = sn
-			return
-		}
-	}
-
-	// Проверяем шасси
-	cmd = exec.Command("dmidecode", "-s", "chassis-serial-number")
-	output, err = cmd.Output()
-	if err == nil {
-		sn := strings.TrimSpace(string(output))
-		if sn != "" && sn != "Not Specified" && sn != "To be filled by O.E.M." {
-			sysInfo.SerialNumber = sn
-			return
-		}
-	}
-
-	// Если ничего не найдено, используем заглушку
-	sysInfo.SerialNumber = "UNKNOWN"
+// Таймер для видеотеста
+func videoTestTimerCmd() tea.Msg {
+	return videoTestTimerTickMsg{}
 }
 
-// Функция для отображения собранной информации
-func showSystemInfo(window fyne.Window) {
-	// Заголовок
-	// Заголовок
-	titleText := canvas.NewText("Troubadour - Системная диагностика", color.NRGBA{205, 214, 244, 255})
-	titleText.TextSize = 18
-	titleText.Alignment = fyne.TextAlignCenter
-	titleText.TextStyle = fyne.TextStyle{Bold: true}
+type videoTestTimerTickMsg struct{}
 
-	// Создаем контейнеры для каждой колонки информации
-	leftColumn := createProcessorMemoryInfo()
-	centerColumn := createGPUNetworkInfo()
-	rightColumn := createStorageInfo()
+// Окончание видеотеста
+type videoTestDoneMsg struct{}
 
-	// Информация о статусе и прогрессе
-	progressContainer := createProgressInfo()
-
-	// Создаем основной контейнер
-	mainContent := container.NewBorder(
-		container.NewVBox(
-			container.NewCenter(titleText),
-			widget.NewSeparator(),
-		),
-		progressContainer,
-		nil,
-		nil,
-		container.NewHBox(
-			leftColumn,
-			widget.NewSeparator(),
-			centerColumn,
-			widget.NewSeparator(),
-			rightColumn,
-		),
-	)
-
-	window.SetContent(mainContent)
-
-	// Автоматически запускаем тест дисплея через небольшую задержку
-	go func() {
-		time.Sleep(2 * time.Second)
-		updateStatusLabel("2. Тест дисплея: в процессе")
-		runDisplayTest(window)
-	}()
+// Команда для проверки серийного номера
+func checkSerialNumberCmd(entered, system string) tea.Msg {
+	if entered == system {
+		return serialMatchedMsg{}
+	}
+	return serialMismatchMsg{
+		entered: entered,
+		system:  system,
+	}
 }
 
-// Создает и возвращает контейнер с информацией о процессоре и памяти
-func createProcessorMemoryInfo() fyne.CanvasObject {
-	// Заголовок раздела процессора
-	cpuTitle := widget.NewLabelWithStyle("Процессор", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-	cpuTitle.Alignment = fyne.TextAlignCenter
+type serialMatchedMsg struct{}
+type serialMismatchMsg struct {
+	entered string
+	system  string
+}
 
-	// Фоновый прямоугольник для заголовка
-	cpuTitleBg := canvas.NewRectangle(color.NRGBA{69, 71, 90, 255})
-	cpuTitleBg.SetMinSize(fyne.NewSize(360, 30))
+// Команда для создания логов
+func createLogFilesCmd(info SystemInfo, dmidecodeRaw string) tea.Msg {
+	// Создаем имя файла с датой и серийным номером
+	timestamp := time.Now().Format("20060102_150405")
+	fileName := fmt.Sprintf("/tmp/troubadour_%s_%s.log", info.SerialNumber, timestamp)
 
-	cpuTitleContainer := container.NewStack(cpuTitleBg, cpuTitle)
+	// Форматируем содержимое лога
+	var logContent strings.Builder
+
+	logContent.WriteString("==== TROUBADOUR SYSTEM DIAGNOSTICS LOG ====\n\n")
+	logContent.WriteString(fmt.Sprintf("Date: %s\n", time.Now().Format(time.RFC1123)))
+	logContent.WriteString(fmt.Sprintf("Serial Number: %s\n\n", info.SerialNumber))
 
 	// Информация о процессоре
-	cpuModel := widget.NewLabel(fmt.Sprintf("Модель: %s", sysInfo.Processor.Model))
-	cpuCores := widget.NewLabel(fmt.Sprintf("Ядра/Потоки: %d/%d", sysInfo.Processor.Cores, sysInfo.Processor.Threads))
-	cpuFreq := widget.NewLabel(fmt.Sprintf("Частота: %.2f МГц", sysInfo.Processor.Frequency))
-	cpuCache := widget.NewLabel(fmt.Sprintf("Кэш: %s", sysInfo.Processor.Cache))
-	cpuArch := widget.NewLabel(fmt.Sprintf("Архитектура: %s", sysInfo.Processor.Architecture))
+	logContent.WriteString("==== PROCESSOR ====\n")
+	logContent.WriteString(fmt.Sprintf("Model: %s\n", info.Processor.Model))
+	logContent.WriteString(fmt.Sprintf("Cores: %d (Threads: %d)\n", info.Processor.Cores, info.Processor.Threads))
+	logContent.WriteString(fmt.Sprintf("Frequency: %s\n", info.Processor.Frequency))
 
-	// Контейнер для информации о процессоре
-	cpuDataContainer := container.NewVBox(
-		cpuModel,
-		cpuCores,
-		cpuFreq,
-		cpuCache,
-		cpuArch,
-	)
-
-	// Добавляем отступы к данным процессора
-	cpuContainer := container.NewBorder(
-		cpuTitleContainer,
-		nil,
-		nil,
-		nil,
-		container.NewPadded(cpuDataContainer),
-	)
-
-	// Заголовок раздела памяти
-	memTitle := widget.NewLabelWithStyle("Оперативная память", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-	memTitle.Alignment = fyne.TextAlignCenter
-
-	// Фоновый прямоугольник для заголовка
-	memTitleBg := canvas.NewRectangle(color.NRGBA{69, 71, 90, 255})
-	memTitleBg.SetMinSize(fyne.NewSize(360, 30))
-
-	memTitleContainer := container.NewStack(memTitleBg, memTitle)
+	logContent.WriteString("Cache:\n")
+	for level, size := range info.Processor.Cache {
+		logContent.WriteString(fmt.Sprintf("  %s: %s\n", level, size))
+	}
+	logContent.WriteString("\n")
 
 	// Информация о памяти
-	memTotal := widget.NewLabel(fmt.Sprintf("Всего: %.2f ГБ", float64(sysInfo.Memory.Total)/(1024*1024*1024)))
-	memFreq := widget.NewLabel(fmt.Sprintf("Частота: %s", sysInfo.Memory.Frequency))
+	logContent.WriteString("==== MEMORY ====\n")
+	logContent.WriteString(fmt.Sprintf("Total: %s\n", info.Memory.Total))
 
-	// Контейнер для информации о памяти
-	memItems := []fyne.CanvasObject{
-		memTotal,
-		memFreq,
+	for _, slot := range info.Memory.Slots {
+		logContent.WriteString(fmt.Sprintf("Slot %s: %s %s @ %s [%s]\n",
+			slot.ID, slot.Manufacturer, slot.Size, slot.Speed, slot.Type))
 	}
+	logContent.WriteString("\n")
 
-	// Добавляем информацию о слотах
-	for _, slot := range sysInfo.Memory.Slots {
-		slotInfo := widget.NewLabel(fmt.Sprintf("Слот %d: %.2f ГБ, %s, %s",
-			slot.SlotNumber,
-			float64(slot.Size)/(1024*1024*1024),
-			slot.Manufacturer,
-			slot.Frequency,
-		))
-		memItems = append(memItems, slotInfo)
+	// Информация о сетевых картах
+	logContent.WriteString("==== NETWORK ====\n")
+	for _, net := range info.Network {
+		logContent.WriteString(fmt.Sprintf("Interface: %s\n", net.Interface))
+		logContent.WriteString(fmt.Sprintf("Model: %s\n", net.Model))
+		logContent.WriteString(fmt.Sprintf("MAC: %s\n\n", net.MAC))
 	}
-
-	memDataContainer := container.NewVBox(memItems...)
-
-	// Добавляем отступы к данным памяти
-	memContainer := container.NewBorder(
-		memTitleContainer,
-		nil,
-		nil,
-		nil,
-		container.NewPadded(memDataContainer),
-	)
-
-	// Фоновый прямоугольник для контейнера
-	bgRect := canvas.NewRectangle(color.NRGBA{45, 45, 60, 255})
-
-	// Объединяем в один контейнер с рамкой
-	content := container.NewBorder(
-		nil,
-		nil,
-		nil,
-		nil,
-		container.NewVBox(
-			cpuContainer,
-			widget.NewSeparator(),
-			memContainer,
-		),
-	)
-
-	return container.NewStack(bgRect, content)
-}
-
-// Создает и возвращает контейнер с информацией о GPU и сети
-func createGPUNetworkInfo() fyne.CanvasObject {
-	// Заголовок раздела GPU
-	gpuTitle := widget.NewLabelWithStyle("Видеокарта", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 
 	// Информация о GPU
-	gpuModel := widget.NewLabel(fmt.Sprintf("Модель: %s", sysInfo.GPU.Model))
-	gpuMem := widget.NewLabel(fmt.Sprintf("Память: %s", sysInfo.GPU.Memory))
-	gpuRes := widget.NewLabel(fmt.Sprintf("Разрешение: %s", sysInfo.GPU.Resolution))
-	gpuDriver := widget.NewLabel(fmt.Sprintf("Драйвер: %s", sysInfo.GPU.Driver))
+	logContent.WriteString("==== GPU ====\n")
+	logContent.WriteString(fmt.Sprintf("Model: %s\n", info.GPU.Model))
+	if info.GPU.Memory != "" {
+		logContent.WriteString(fmt.Sprintf("Memory: %s\n", info.GPU.Memory))
+	}
+	if info.GPU.Driver != "" {
+		logContent.WriteString(fmt.Sprintf("Driver: %s\n", info.GPU.Driver))
+	}
+	logContent.WriteString("\n")
 
-	// Контейнер для информации о GPU
-	gpuContainer := container.NewVBox(
-		gpuTitle,
-		gpuModel,
-		gpuMem,
-		gpuRes,
-		gpuDriver,
-	)
-
-	// Заголовок раздела сети
-	netTitle := widget.NewLabelWithStyle("Сетевые карты", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-
-	// Контейнер для информации о сетевых картах
-	netItems := []fyne.CanvasObject{netTitle}
-
-	// Если сетевых карт нет
-	if len(sysInfo.NetworkCards) == 0 {
-		netItems = append(netItems, widget.NewLabel("Не обнаружено сетевых карт"))
-	} else {
-		// Добавляем информацию о каждой сетевой карте
-		for i, card := range sysInfo.NetworkCards {
-			cardInfo := widget.NewLabel(fmt.Sprintf("Карта %d: %s", i+1, card.Model))
-			macInfo := widget.NewLabel(fmt.Sprintf("MAC: %s", card.MACAddress))
-			netItems = append(netItems, cardInfo, macInfo)
+	// Информация о накопителях
+	logContent.WriteString("==== STORAGE ====\n")
+	for _, storage := range info.Storage {
+		logContent.WriteString(fmt.Sprintf("Type: %s\n", storage.Type))
+		logContent.WriteString(fmt.Sprintf("Model: %s\n", storage.Model))
+		logContent.WriteString(fmt.Sprintf("Size: %s\n", storage.Size))
+		if storage.Label != "" {
+			logContent.WriteString(fmt.Sprintf("Label: %s\n", storage.Label))
 		}
+		logContent.WriteString("\n")
 	}
 
-	netContainer := container.NewVBox(netItems...)
-
-	// Объединяем в один контейнер
-	return container.NewVBox(
-		container.NewVBox(gpuContainer),
-		widget.NewSeparator(),
-		container.NewVBox(netContainer),
-	)
-}
-
-// Создает и возвращает контейнер с информацией о хранилищах
-func createStorageInfo() fyne.CanvasObject {
-	// Заголовок раздела
-	title := widget.NewLabelWithStyle("Носители информации", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-
-	// Группируем устройства по типу
-	nvmeDevices := []StorageDeviceInfo{}
-	ssdDevices := []StorageDeviceInfo{}
-	hddDevices := []StorageDeviceInfo{}
-	flashDevices := []StorageDeviceInfo{}
-	otherDevices := []StorageDeviceInfo{}
-
-	for _, device := range sysInfo.StorageDevices {
-		switch device.Type {
-		case "NVME":
-			nvmeDevices = append(nvmeDevices, device)
-		case "SSD":
-			ssdDevices = append(ssdDevices, device)
-		case "HDD":
-			hddDevices = append(hddDevices, device)
-		case "Flash":
-			flashDevices = append(flashDevices, device)
-		default:
-			otherDevices = append(otherDevices, device)
-		}
-	}
-
-	// Создаем контейнеры для каждого типа
-	items := []fyne.CanvasObject{title}
-
-	// Функция для создания списка устройств определенного типа
-	createDeviceList := func(devices []StorageDeviceInfo, typeName string) []fyne.CanvasObject {
-		if len(devices) == 0 {
-			return nil
-		}
-
-		result := []fyne.CanvasObject{
-			widget.NewLabelWithStyle(typeName, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		}
-
-		for _, device := range devices {
-			info := fmt.Sprintf("%s: %.2f ГБ",
-				device.Model,
-				float64(device.Size)/(1024*1024*1024),
-			)
-
-			if device.Label != "" {
-				info += fmt.Sprintf(" (%s)", device.Label)
-			}
-
-			result = append(result, widget.NewLabel(info))
-		}
-
-		return result
-	}
-
-	// Добавляем контейнеры, если есть устройства
-	if list := createDeviceList(nvmeDevices, "NVME:"); list != nil {
-		items = append(items, list...)
-		items = append(items, widget.NewSeparator())
-	}
-
-	if list := createDeviceList(ssdDevices, "SSD:"); list != nil {
-		items = append(items, list...)
-		items = append(items, widget.NewSeparator())
-	}
-
-	if list := createDeviceList(hddDevices, "HDD:"); list != nil {
-		items = append(items, list...)
-		items = append(items, widget.NewSeparator())
-	}
-
-	if list := createDeviceList(flashDevices, "Flash:"); list != nil {
-		items = append(items, list...)
-		items = append(items, widget.NewSeparator())
-	}
-
-	if list := createDeviceList(otherDevices, "Другие:"); list != nil {
-		items = append(items, list...)
-	}
-
-	// Если нет устройств
-	if len(items) == 1 {
-		items = append(items, widget.NewLabel("Не обнаружено устройств хранения"))
-	}
-
-	return container.NewVBox(items...)
-}
-
-// Создает и возвращает контейнер с информацией о прогрессе и статусе
-func createProgressInfo() fyne.CanvasObject {
-	// Заголовок для прогресса
-	progressTitle := widget.NewLabelWithStyle("Прогресс этапов", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-
-	// Статусы этапов
-	status1 := widget.NewLabel("1. Сбор информации: завершен")
-	status2 := widget.NewLabel("2. Тест дисплея: в ожидании")
-	status3 := widget.NewLabel("3. Проверка серийного номера: в ожидании")
-	status4 := widget.NewLabel("4. Создание логов: в ожидании")
-
-	// Сохраняем ссылку на статус для обновления
-	statusLabel = status2
-
-	// Контейнер для статусов
-	statusContainer := container.NewVBox(
-		progressTitle,
-		status1,
-		status2,
-		status3,
-		status4,
-	)
-
-	// Заголовок для горячих клавиш
-	hotkeysTitle := widget.NewLabelWithStyle("Горячие клавиши", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-
-	// Горячие клавиши
-	hotkeyEnter := widget.NewLabel("Y/Enter - Подтвердить")
-	hotkeyN := widget.NewLabel("N - Повторить тест")
-	hotkeyR := widget.NewLabel("R - Пересканировать систему")
-	hotkeyQ := widget.NewLabel("Q/Esc - Выйти из программы")
-
-	// Контейнер для горячих клавиш
-	hotkeysContainer := container.NewVBox(
-		hotkeysTitle,
-		hotkeyEnter,
-		hotkeyN,
-		hotkeyR,
-		hotkeyQ,
-	)
-
-	// Индикатор текущего этапа
-	currentStageLabel := widget.NewLabelWithStyle(
-		"Этап 1/4: Сбор информации - завершен",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{Bold: true},
-	)
-
-	// Объединяем в один контейнер
-	return container.NewVBox(
-		container.NewHBox(
-			container.NewVBox(statusContainer),
-			widget.NewSeparator(),
-			container.NewVBox(hotkeysContainer),
-		),
-		widget.NewSeparator(),
-		currentStageLabel,
-	)
-}
-
-// Обновляет метку статуса
-func updateStatusLabel(text string) {
-	if statusLabel != nil {
-		statusLabel.SetText(text)
-		statusLabel.Refresh()
-	}
-}
-
-// Функция для проведения теста дисплея
-func runDisplayTest(window fyne.Window) {
-	// Сохраняем предыдущий контент
-	prevContent := window.Content()
-
-	// Создаем элементы для теста дисплея
-	// Заголовок
-	titleText := canvas.NewText("Тест дисплея", color.NRGBA{255, 255, 255, 255})
-	titleText.TextSize = 24
-	titleText.Alignment = fyne.TextAlignCenter
-	titleText.TextStyle = fyne.TextStyle{Bold: true}
-
-	// RGB-градиент
-	rgbRect := canvas.NewRectangle(color.RGBA{255, 0, 0, 255})
-	rgbRect.SetMinSize(fyne.NewSize(1000, 150))
-
-	// Функция для изменения цвета прямоугольника
-	updateRGB := func(progress float64) {
-		r := uint8(255 * (1 - progress))
-		g := uint8(255 * progress)
-		b := uint8(255 * math.Abs(0.5-progress) * 2)
-		rgbRect.FillColor = color.RGBA{r, g, b, 255}
-		canvas.Refresh(rgbRect)
-	}
-
-	rgbLabel := widget.NewLabelWithStyle(
-		"RGB Градиент - проверьте плавность переходов цветов",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{},
-	)
-
-	// Шкала серого
-	grayRect := canvas.NewRectangle(color.Gray{0})
-	grayRect.SetMinSize(fyne.NewSize(1000, 100))
-
-	// Функция для изменения серого цвета
-	updateGray := func(progress float64) {
-		value := uint8(255 * progress)
-		grayRect.FillColor = color.Gray{value}
-		canvas.Refresh(grayRect)
-	}
-
-	grayLabel := widget.NewLabelWithStyle(
-		"Шкала серого - оцените разницу между оттенками",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{},
-	)
-
-	// Сетка для геометрии
-	gridContainer := container.NewGridWithColumns(10)
-	for i := 0; i < 100; i++ {
-		cell := canvas.NewRectangle(color.RGBA{220, 220, 220, 255})
-		cell.SetMinSize(fyne.NewSize(50, 25))
-		cell.StrokeWidth = 1
-		cell.StrokeColor = color.RGBA{100, 100, 100, 255}
-		gridContainer.Add(cell)
-	}
-
-	gridLabel := widget.NewLabelWithStyle(
-		"Проверка геометрии - убедитесь, что линии прямые и имеют одинаковое расстояние",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{},
-	)
-
-	// Цветовые блоки
-	colorContainer := container.NewHBox(
-		createColorBlock(color.RGBA{255, 0, 0, 255}),
-		createColorBlock(color.RGBA{0, 255, 0, 255}),
-		createColorBlock(color.RGBA{0, 0, 255, 255}),
-		createColorBlock(color.RGBA{255, 255, 255, 255}),
-		createColorBlock(color.RGBA{0, 0, 0, 255}),
-	)
-
-	// Запрос подтверждения
-	confirmLabel := widget.NewLabelWithStyle(
-		"Все в порядке? [Y/n] (Enter - Да, N - Нет)",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{Bold: true},
-	)
-
-	// Создаем контент для теста дисплея
-	displayTestContent := container.NewVBox(
-		container.NewVBox(
-			container.NewCenter(titleText),
-			container.NewCenter(rgbRect),
-			container.NewCenter(rgbLabel),
-			container.NewCenter(grayRect),
-			container.NewCenter(grayLabel),
-			container.NewCenter(container.NewPadded(gridContainer)),
-			container.NewCenter(gridLabel),
-			container.NewCenter(colorContainer),
-			container.NewCenter(confirmLabel),
-		),
-	)
-
-	// Устанавливаем контент
-	window.SetContent(displayTestContent)
-
-	// Запускаем анимацию для RGB и серого
-	go func() {
-		steps := 100
-		for i := 0; i <= steps; i++ {
-			progress := float64(i) / float64(steps)
-			updateRGB(progress)
-			updateGray(progress)
-			time.Sleep(30 * time.Millisecond)
-		}
-	}()
-
-	// Обрабатываем нажатия клавиш
-	window.Canvas().SetOnTypedKey(func(key *fyne.KeyEvent) {
-		if key.Name == fyne.KeyY || key.Name == fyne.KeyReturn {
-			// Пользователь подтвердил, что тест прошел успешно
-			sysInfo.TestResults.DisplayTest = true
-
-			// Возвращаем предыдущий контент
-			window.SetContent(prevContent)
-
-			// Обновляем статус
-			updateStatusLabel("2. Тест дисплея: завершен")
-
-			// Переходим к проверке серийного номера
-			time.Sleep(500 * time.Millisecond)
-			updateStatusLabel("3. Проверка серийного номера: в процессе")
-			checkSerialNumber(window)
-		} else if key.Name == fyne.KeyN {
-			// Пользователь хочет повторить тест
-			runDisplayTest(window)
-		}
-	})
-}
-
-// Вспомогательная функция для создания цветного блока
-func createColorBlock(clr color.Color) fyne.CanvasObject {
-	rect := canvas.NewRectangle(clr)
-	rect.SetMinSize(fyne.NewSize(150, 60))
-	return rect
-}
-
-// Функция для проверки серийного номера
-func checkSerialNumber(window fyne.Window) {
-	// Сохраняем предыдущий контент
-	prevContent := window.Content()
-
-	// Заголовок
-	// Заголовок
-	titleText := canvas.NewText("Проверка серийного номера", color.NRGBA{205, 214, 244, 255})
-	titleText.TextSize = 24
-	titleText.Alignment = fyne.TextAlignCenter
-	titleText.TextStyle = fyne.TextStyle{Bold: true}
-
-	// Показываем системный серийный номер
-	systemSNLabel := widget.NewLabel("Серийный номер компьютера (из системы):")
-	systemSNValue := widget.NewLabelWithStyle(
-		sysInfo.SerialNumber,
-		fyne.TextAlignLeading,
-		fyne.TextStyle{Bold: true},
-	)
-
-	// Поле для ввода пользовательского серийного номера
-	userSNLabel := widget.NewLabel("Введите серийный номер для проверки:")
-	userSNEntry := widget.NewEntry()
-	userSNEntry.SetPlaceHolder("Введите серийный номер")
-
-	// Кнопка подтверждения
-	confirmButton := widget.NewButton("Продолжить [Enter]", nil)
-
-	// Функция для проверки серийного номера
-	checkSN := func() {
-		userSN := userSNEntry.Text
-		sysInfo.TestResults.UserEnteredSN = userSN
-
-		// Проверяем совпадение серийных номеров
-		if userSN == sysInfo.SerialNumber {
-			sysInfo.TestResults.SerialNumberVerified = true
-
-			// Возвращаем предыдущий контент
-			window.SetContent(prevContent)
-
-			// Обновляем статус
-			updateStatusLabel("3. Проверка серийного номера: завершен")
-
-			// Переходим к созданию логов
-			time.Sleep(500 * time.Millisecond)
-			updateStatusLabel("4. Создание логов: в процессе")
-			createLogFile()
-
-			// Обновляем статус
-			updateStatusLabel("4. Создание логов: завершен")
-
-			// Показываем итоговый экран
-			time.Sleep(500 * time.Millisecond)
-			showFinalScreen(window)
-		} else {
-			// Серийные номера не совпадают
-			sysInfo.TestResults.SerialNumberVerified = false
-
-			// Показываем сообщение об ошибке
-			errorLabel := widget.NewLabelWithStyle(
-				"ВНИМАНИЕ! Серийные номера не совпадают!",
-				fyne.TextAlignCenter,
-				fyne.TextStyle{Bold: true},
-			)
-
-			dialog.ShowCustom("Ошибка", "Продолжить", container.NewVBox(
-				errorLabel,
-				widget.NewLabel("Введенный серийный номер не соответствует серийному номеру системы."),
-				widget.NewLabel("Это будет отмечено в логах."),
-			), window)
-
-			// После закрытия диалога продолжаем
-			window.SetContent(prevContent)
-
-			// Обновляем статус
-			updateStatusLabel("3. Проверка серийного номера: ошибка")
-
-			// Переходим к созданию логов
-			time.Sleep(500 * time.Millisecond)
-			updateStatusLabel("4. Создание логов: в процессе")
-			createLogFile()
-
-			// Обновляем статус
-			updateStatusLabel("4. Создание логов: завершен")
-
-			// Показываем итоговый экран
-			time.Sleep(500 * time.Millisecond)
-			showFinalScreen(window)
-		}
-	}
-
-	// Устанавливаем обработчик для кнопки
-	confirmButton.OnTapped = checkSN
-
-	// Обработчик для поля ввода (Enter)
-	userSNEntry.OnSubmitted = func(text string) {
-		checkSN()
-	}
-
-	// Подсказка
-	hintLabel := widget.NewLabel("Введите серийный номер и нажмите Enter")
-
-	// Создаем контент для проверки серийного номера
-	snContent := container.NewVBox(
-		container.NewCenter(titleText),
-		container.NewVBox(
-			container.NewCenter(widget.NewLabelWithStyle(
-				"Проверка серийного номера",
-				fyne.TextAlignCenter,
-				fyne.TextStyle{Bold: true},
-			)),
-		),
-		container.NewCenter(container.NewVBox(
-			systemSNLabel,
-			systemSNValue,
-			widget.NewSeparator(),
-			userSNLabel,
-			userSNEntry,
-			container.NewCenter(confirmButton),
-			container.NewCenter(hintLabel),
-		)),
-	)
-
-	// Устанавливаем контент
-	window.SetContent(snContent)
-
-	// Fyne автоматически установит фокус на первый фокусируемый виджет
-	// Явно устанавливать фокус не требуется
-}
-
-// Функция для создания и сохранения лога
-func createLogFile() {
-	// Создание директории для логов, если её нет
-	logDir := "troubadour_logs"
-	if _, err := os.Stat(logDir); os.IsNotExist(err) {
-		os.Mkdir(logDir, 0755)
-	}
-
-	// Форматирование имени файла
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	logFileName := filepath.Join(logDir, fmt.Sprintf("%s_%s.log", sysInfo.SerialNumber, timestamp))
-
-	// Получаем полную информацию dmidecode для логов
-	dmidecodeInfo := getDmidecodeInfo()
-
-	// Создаем структуру для лога
-	logData := struct {
-		SystemInfo    SystemInfo          `json:"system_info"`
-		DmidecodeInfo map[string][]string `json:"dmidecode_info"`
-		TestResults   TestResults         `json:"test_results"`
-		Timestamp     string              `json:"timestamp"`
-	}{
-		SystemInfo:    sysInfo,
-		DmidecodeInfo: dmidecodeInfo,
-		TestResults:   sysInfo.TestResults,
-		Timestamp:     timestamp,
-	}
-
-	// Сериализация данных в JSON
-	jsonData, err := json.MarshalIndent(logData, "", "  ")
+	// Добавляем сырой вывод dmidecode
+	logContent.WriteString("==== RAW DMIDECODE DATA ====\n")
+	logContent.WriteString(dmidecodeRaw)
+
+	// Записываем лог в файл
+	err := ioutil.WriteFile(fileName, []byte(logContent.String()), 0644)
 	if err != nil {
-		fmt.Println("Error creating log file:", err)
-		return
+		return errMsg{err}
 	}
 
-	// Запись файла
-	err = ioutil.WriteFile(logFileName, jsonData, 0644)
-	if err != nil {
-		fmt.Println("Error writing log file:", err)
-		return
+	return logCreatedMsg{
+		fileName: fileName,
 	}
 }
 
-// Функция для получения полной информации dmidecode
-func getDmidecodeInfo() map[string][]string {
-	dmidecodeInfo := make(map[string][]string)
+type logCreatedMsg struct {
+	fileName string
+}
 
-	// Список секций dmidecode
-	sections := []string{
-		"bios", "system", "baseboard", "chassis", "processor",
-		"memory", "cache", "connector", "slot",
-	}
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 
-	for _, section := range sections {
-		cmd := exec.Command("dmidecode", "-t", section)
-		output, err := cmd.Output()
-		if err != nil {
-			fmt.Println("Error fetching dmidecode info for section", section, ":", err)
-			continue
-		}
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
 
-		outputStr := string(output)
-		lines := strings.Split(outputStr, "\n")
+		case "enter":
+			switch m.state {
+			case stateShowInfo:
+				// Переходим к видео тесту
+				m.state = stateVideoTest
+				m.videoTestActive = true
+				m.videoTestColor = 0
+				m.videoTestStart = time.Now()
+				return m, startVideoTestCmd
 
-		// Парсим заголовки/разделы
-		var currentHeader string
-		var currentContent []string
+			case stateAskVideoOk:
+				// Если ответ "Y" (по умолчанию), продолжаем к проверке серийника
+				m.state = stateAskSerial
+				m.showOverlay = true
+				return m, nil
 
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-
-			// Проверяем, является ли строка заголовком
-			if strings.HasPrefix(line, "Handle ") {
-				// Если у нас уже есть заголовок, сохраняем предыдущий раздел
-				if currentHeader != "" {
-					dmidecodeInfo[currentHeader] = currentContent
+			case stateAskSerial:
+				// Проверяем серийный номер
+				m.userSerial = m.textInput.Value()
+				m.state = stateCheckSerial
+				return m, func() tea.Msg {
+					return checkSerialNumberCmd(m.userSerial, m.sysInfo.SerialNumber)
 				}
 
-				// Начинаем новый раздел
-				currentHeader = line
-				currentContent = []string{}
-			} else if line != "" {
-				// Добавляем строку к текущему разделу
-				currentContent = append(currentContent, line)
+			case stateSerialError:
+				// Повторная проверка серийника
+				m.state = stateAskSerial
+				m.textInput.SetValue("")
+				return m, nil
+
+			case stateDone:
+				// Завершаем программу
+				return m, tea.Quit
+			}
+
+		case "n":
+			if m.state == stateAskVideoOk {
+				// Повторяем тест
+				m.state = stateVideoTest
+				m.videoTestActive = true
+				m.videoTestColor = 0
+				m.videoTestStart = time.Now()
+				return m, startVideoTestCmd
 			}
 		}
 
-		// Добавляем последний раздел
-		if currentHeader != "" {
-			dmidecodeInfo[currentHeader] = currentContent
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 6 // Учитываем место для заголовка и подвала
+
+	case errMsg:
+		m.err = msg.error
+		return m, tea.Quit
+
+	case sysInfoCollectedMsg:
+		m.sysInfo = msg.sysInfo
+		m.dmidecodeRaw = msg.dmidecodeRaw
+		m.state = stateShowInfo
+		return m, nil
+
+	case startVideoTestMsg:
+		// Запускаем таймер для смены цветов в видеотесте
+		return m, tea.Tick(time.Second, func(time.Time) tea.Msg {
+			return videoTestTimerTickMsg{}
+		})
+
+	case videoTestTimerTickMsg:
+		if m.videoTestActive {
+			elapsedSeconds := int(time.Since(m.videoTestStart).Seconds())
+
+			// Каждые 3 секунды меняем цвет (красный -> зеленый -> синий -> завершение)
+			if elapsedSeconds >= 9 {
+				// Завершаем тест после 9 секунд
+				m.videoTestActive = false
+				m.state = stateAskVideoOk
+				return m, nil
+			} else {
+				m.videoTestColor = (elapsedSeconds / 3) % 3
+				// Продолжаем таймер
+				return m, tea.Tick(time.Second, func(time.Time) tea.Msg {
+					return videoTestTimerTickMsg{}
+				})
+			}
 		}
+		return m, nil
+
+	case videoTestDoneMsg:
+		m.videoTestActive = false
+		m.state = stateAskVideoOk
+		return m, nil
+
+	case serialMatchedMsg:
+		// Серийный номер совпал, создаем логи
+		m.state = stateCreateLogs
+		m.showOverlay = true
+		return m, func() tea.Msg {
+			return createLogFilesCmd(m.sysInfo, m.dmidecodeRaw)
+		}
+
+	case serialMismatchMsg:
+		// Серийный номер не совпал, показываем ошибку
+		m.state = stateSerialError
+		m.userSerial = msg.entered
+		m.showOverlay = true
+		return m, nil
+
+	case logCreatedMsg:
+		m.state = stateDone
+		m.logFilePath = msg.fileName
+		return m, nil
 	}
 
-	return dmidecodeInfo
+	// Обновляем компоненты
+	switch m.state {
+	case stateInit:
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
+	case stateAskSerial:
+		m.textInput, cmd = m.textInput.Update(msg)
+		return m, cmd
+	}
+
+	return m, nil
 }
 
-// Функция для отображения итогового экрана
-func showFinalScreen(window fyne.Window) {
-	// Заголовок
-	// Заголовок
-	titleText := canvas.NewText("Troubadour - Завершение диагностики", color.NRGBA{205, 214, 244, 255})
-	titleText.TextSize = 24
-	titleText.Alignment = fyne.TextAlignCenter
-	titleText.TextStyle = fyne.TextStyle{Bold: true}
+func (m model) View() string {
+	// Стили для отображения
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FAFAFA")).
+		Background(lipgloss.Color("#1D1D1D")).
+		MarginTop(1).
+		MarginBottom(1).
+		Width(m.width).
+		Align(lipgloss.Center)
 
-	// Статус
-	// Статус
-	statusText := canvas.NewText("Все этапы успешно завершены", color.NRGBA{166, 227, 161, 255})
-	statusText.TextSize = 18
-	statusText.Alignment = fyne.TextAlignCenter
-	statusText.TextStyle = fyne.TextStyle{Bold: true}
+	borderStyle := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#3C3C3C")).
+		Width(m.width-4).
+		Padding(0, 1)
 
-	// Информация о логах
-	logTitle := widget.NewLabelWithStyle(
-		"Информация о логах",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{Bold: true},
-	)
+	sectionStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#3C3C3C")).
+		Padding(0, 1)
 
-	// Форматирование имени файла
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	logFileName := fmt.Sprintf("%s_%s.log", sysInfo.SerialNumber, timestamp)
+	sectionTitleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#E8E8E8"))
 
-	logPathLabel := widget.NewLabel(fmt.Sprintf("Логи успешно созданы по пути: troubadour_logs/%s", logFileName))
+	errorStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color("#FF0000")).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#880000")).
+		Padding(1, 2).
+		Align(lipgloss.Center)
 
-	// Содержимое лога
-	logContentTitle := widget.NewLabel("Содержание логов:")
+	footerStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#CDCDCD")).
+		Padding(0, 2)
 
-	displayTestResult := "Успешно"
-	if !sysInfo.TestResults.DisplayTest {
-		displayTestResult = "Не пройден"
-	}
+	overlayStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color("#222222")).
+		Padding(2, 4).
+		Align(lipgloss.Center)
 
-	snTestResult := "Подтверждено"
-	if !sysInfo.TestResults.SerialNumberVerified {
-		snTestResult = "Не подтверждено"
-	}
+	// Если активен видеотест, показываем его на весь экран
+	if m.videoTestActive {
+		var colorBg string
+		var colorName string
 
-	logContentItems := []fyne.CanvasObject{
-		widget.NewLabel("• Информация о выявленном оборудовании"),
-		widget.NewLabel("• Результаты теста дисплея: " + displayTestResult),
-		widget.NewLabel("• Проверка серийного номера: " + snTestResult),
-		widget.NewLabel("• Полная информация dmidecode"),
-		widget.NewLabel("• Общий статус системы: Нормальный"),
-	}
-
-	logContentBox := container.NewVBox(append([]fyne.CanvasObject{logContentTitle}, logContentItems...)...)
-
-	// Блок действий
-	actionsTitle := widget.NewLabelWithStyle(
-		"Что дальше?",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{Bold: true},
-	)
-
-	// Кнопки действий
-	rescanButton := widget.NewButton("Пересканировать [R]", func() {
-		sysInfo = SystemInfo{}
-		startDiagnosticSequence(window)
-	})
-
-	exitButton := widget.NewButton("Выход [Q, Esc]", func() {
-		window.Close()
-	})
-
-	// Обработчик клавиш
-	window.Canvas().SetOnTypedKey(func(key *fyne.KeyEvent) {
-		if key.Name == fyne.KeyR {
-			sysInfo = SystemInfo{}
-			startDiagnosticSequence(window)
-		} else if key.Name == fyne.KeyQ || key.Name == fyne.KeyEscape {
-			window.Close()
+		switch m.videoTestColor {
+		case 0:
+			colorBg = "#FF0000"
+			colorName = "RED"
+		case 1:
+			colorBg = "#00FF00"
+			colorName = "GREEN"
+		case 2:
+			colorBg = "#0000FF"
+			colorName = "BLUE"
 		}
-	})
 
-	// Создаем контент для итогового экрана
-	finalContent := container.NewVBox(
-		container.NewCenter(titleText),
-		container.NewCenter(statusText),
-		widget.NewSeparator(),
-		container.NewCenter(logTitle),
-		container.NewCenter(logPathLabel),
-		container.NewCenter(logContentBox),
-		widget.NewSeparator(),
-		container.NewCenter(actionsTitle),
-		container.NewCenter(rescanButton),
-		container.NewCenter(exitButton),
+		testBg := lipgloss.NewStyle().
+			Background(lipgloss.Color(colorBg)).
+			Width(m.width).
+			Height(m.height - 2)
+
+		progressInfo := fmt.Sprintf(
+			"Testing video... %s (%d/3) [%d sec remaining]",
+			colorName,
+			m.videoTestColor+1,
+			9-int(time.Since(m.videoTestStart).Seconds()),
+		)
+
+		return fmt.Sprintf(
+			"%s\n%s",
+			testBg.Render(""),
+			lipgloss.NewStyle().
+				Align(lipgloss.Center).
+				Width(m.width).
+				Foreground(lipgloss.Color("#FFFFFF")).
+				Background(lipgloss.Color("#000000")).
+				Render(progressInfo),
+		)
+	}
+
+	// Инициализация - показываем спиннер
+	if m.state == stateInit {
+		return borderStyle.Render(fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			titleStyle.Render("TROUBADOUR"),
+			lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width-6).Render("Collecting system information..."),
+			lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width-6).Render(m.spinner.View()),
+		))
+	}
+
+	// Базовый вывод информации о системе
+	mainContent := strings.Builder{}
+
+	// Расставляем информацию в две колонки
+	// Колонка 1: Процессор и Сеть
+	// Колонка 2: Память, GPU и Хранение
+
+	leftColWidth := (m.width - 12) / 2
+	rightColWidth := (m.width - 12) / 2
+
+	// Формируем левую колонку
+	leftCol := strings.Builder{}
+
+	// Процессор
+	cpuContent := strings.Builder{}
+	cpuContent.WriteString(fmt.Sprintf("Model: %s\n", m.sysInfo.Processor.Model))
+	cpuContent.WriteString(fmt.Sprintf("Cores: %d (Threads: %d)\n", m.sysInfo.Processor.Cores, m.sysInfo.Processor.Threads))
+	cpuContent.WriteString(fmt.Sprintf("Freq: %s\n", m.sysInfo.Processor.Frequency))
+
+	cacheStr := ""
+	for level, size := range m.sysInfo.Processor.Cache {
+		if cacheStr != "" {
+			cacheStr += " "
+		}
+		cacheStr += fmt.Sprintf("%s:%s", level, size)
+	}
+	cpuContent.WriteString(fmt.Sprintf("Cache: %s", cacheStr))
+
+	leftCol.WriteString(sectionStyle.Width(leftColWidth).Render(
+		fmt.Sprintf("%s\n%s",
+			sectionTitleStyle.Render("─── PROCESSOR ───"),
+			cpuContent.String(),
+		),
+	))
+
+	// Сеть
+	netContent := strings.Builder{}
+	for _, net := range m.sysInfo.Network {
+		netContent.WriteString(fmt.Sprintf("%s: %s\n", net.Interface, net.Model))
+		netContent.WriteString(fmt.Sprintf("MAC: %s\n\n", net.MAC))
+	}
+
+	leftCol.WriteString("\n\n")
+	leftCol.WriteString(sectionStyle.Width(leftColWidth).Render(
+		fmt.Sprintf("%s\n%s",
+			sectionTitleStyle.Render("─── NETWORK ───"),
+			netContent.String(),
+		),
+	))
+
+	// Формируем правую колонку
+	rightCol := strings.Builder{}
+
+	// Память
+	memContent := strings.Builder{}
+	memContent.WriteString(fmt.Sprintf("Total: %s\n\n", m.sysInfo.Memory.Total))
+
+	for _, slot := range m.sysInfo.Memory.Slots {
+		memContent.WriteString(fmt.Sprintf("Slot %s: %s %s\n",
+			slot.ID, slot.Manufacturer, slot.Size))
+		memContent.WriteString(fmt.Sprintf("         %s %s\n\n",
+			slot.Speed, slot.Type))
+	}
+
+	rightCol.WriteString(sectionStyle.Width(rightColWidth).Render(
+		fmt.Sprintf("%s\n%s",
+			sectionTitleStyle.Render("─── MEMORY ───"),
+			memContent.String(),
+		),
+	))
+
+	// GPU
+	gpuContent := strings.Builder{}
+	gpuContent.WriteString(fmt.Sprintf("Model: %s\n", m.sysInfo.GPU.Model))
+	if m.sysInfo.GPU.Memory != "" {
+		gpuContent.WriteString(fmt.Sprintf("Memory: %s\n", m.sysInfo.GPU.Memory))
+	}
+	if m.sysInfo.GPU.Driver != "" {
+		gpuContent.WriteString(fmt.Sprintf("Driver: %s\n", m.sysInfo.GPU.Driver))
+	}
+
+	rightCol.WriteString("\n\n")
+	rightCol.WriteString(sectionStyle.Width(rightColWidth).Render(
+		fmt.Sprintf("%s\n%s",
+			sectionTitleStyle.Render("─── GPU ───"),
+			gpuContent.String(),
+		),
+	))
+
+	// Хранение
+	storageContent := strings.Builder{}
+	for _, storage := range m.sysInfo.Storage {
+		storageContent.WriteString(fmt.Sprintf("%s: %s %s\n",
+			storage.Type, storage.Model, storage.Size))
+		if storage.Label != "" {
+			storageContent.WriteString(fmt.Sprintf("Label: %s\n", storage.Label))
+		}
+		storageContent.WriteString("\n")
+	}
+
+	rightCol.WriteString("\n\n")
+	rightCol.WriteString(sectionStyle.Width(rightColWidth).Render(
+		fmt.Sprintf("%s\n%s",
+			sectionTitleStyle.Render("─── STORAGE ───"),
+			storageContent.String(),
+		),
+	))
+
+	// Формируем общий вывод, размещая колонки рядом
+	leftRows := strings.Split(leftCol.String(), "\n")
+	rightRows := strings.Split(rightCol.String(), "\n")
+
+	maxRows := len(leftRows)
+	if len(rightRows) > maxRows {
+		maxRows = len(rightRows)
+	}
+
+	// Добавляем пустые строки, если нужно
+	for len(leftRows) < maxRows {
+		leftRows = append(leftRows, "")
+	}
+	for len(rightRows) < maxRows {
+		rightRows = append(rightRows, "")
+	}
+
+	for i := 0; i < maxRows; i++ {
+		mainContent.WriteString(fmt.Sprintf("%-*s  %-*s\n",
+			leftColWidth, leftRows[i], rightColWidth, rightRows[i]))
+	}
+
+	baseView := fmt.Sprintf(
+		"%s\n%s\n\n%s",
+		titleStyle.Render("TROUBADOUR"),
+		borderStyle.Render(mainContent.String()),
+		footerStyle.Render("Press ENTER to continue to video test..."),
 	)
 
-	window.SetContent(finalContent)
+	// Если не нужно показывать оверлей, возвращаем базовый вид
+	if !m.showOverlay && m.state != stateVideoTest {
+		return baseView
+	}
+
+	// Подготавливаем оверлей в зависимости от состояния
+	var overlayContent string
+
+	switch m.state {
+	case stateAskVideoOk:
+		overlayContent = fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			lipgloss.NewStyle().Bold(true).Render("Video Test Completed"),
+			"Did all test patterns display correctly?",
+			"[Y] Yes (default)   [n] No, run test again",
+		)
+
+	case stateAskSerial:
+		overlayContent = fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification"),
+			fmt.Sprintf("System Serial Number: %s", m.sysInfo.SerialNumber),
+			fmt.Sprintf("Please enter Serial Number: %s", m.textInput.View()),
+		)
+
+	case stateSerialError:
+		errorBox := errorStyle.Width(40).Render(fmt.Sprintf(
+			"Serial numbers DO NOT match!\n\nSystem: %s\nEntered: %s",
+			m.sysInfo.SerialNumber, m.userSerial,
+		))
+
+		overlayContent = fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification"),
+			errorBox,
+			"Press ENTER to try again",
+		)
+
+	case stateCreateLogs:
+		overlayContent = fmt.Sprintf(
+			"%s\n\n%s\n\n%s\n%s\n%s\n%s",
+			lipgloss.NewStyle().Bold(true).Render("Log Creation"),
+			"Creating system logs...",
+			"■ Hardware information collected",
+			"■ System verification completed",
+			"■ dmidecode data parsed",
+			"□ Writing log file...",
+		)
+
+	case stateDone:
+		overlayContent = fmt.Sprintf(
+			"%s\n\n%s\n\n%s\n\n%s",
+			lipgloss.NewStyle().Bold(true).Render("Log Creation Completed"),
+			"All diagnostics completed successfully.",
+			fmt.Sprintf("Output file: %s", m.logFilePath),
+			"Press ENTER to exit",
+		)
+	}
+
+	// Рассчитываем размер и положение оверлея
+	overlayWidth := m.width / 2
+	if overlayWidth < 50 {
+		overlayWidth = m.width - 10
+	}
+
+	overlay := overlayStyle.Width(overlayWidth).Render(overlayContent)
+
+	// Собираем финальный вид с оверлеем
+	return lipgloss.Place(
+		m.width,
+		m.height,
+		lipgloss.Center,
+		lipgloss.Center,
+		overlay,
+		lipgloss.curre(baseView),
+	)
+
+	// Если произошла ошибка
+	if m.err != nil {
+		return borderStyle.Render(fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			titleStyle.Render("TROUBADOUR"),
+			errorStyle.Render(fmt.Sprintf("ERROR: %v", m.err)),
+			footerStyle.Render("Press any key to exit"),
+		))
+	}
+
+	return "Loading..."
+}
+
+func main() {
+	// Проверяем, что программа запущена от имени root
+	if os.Geteuid() != 0 {
+		fmt.Println("Эта программа должна быть запущена с правами root. Используйте sudo или su.")
+		os.Exit(1)
+	}
+
+	// Очищаем экран перед запуском для исключения артефактов отображения
+	fmt.Print("\033[H\033[2J")
+
+	p := tea.NewProgram(
+		initialModel(),
+		tea.WithAltScreen(),       // Используем альтернативный экран
+		tea.WithMouseCellMotion(), // Поддержка мыши для лучшего взаимодействия
+	)
+
+	// Запускаем программу
+	if _, err := p.Run(); err != nil {
+		fmt.Println("Ошибка выполнения программы:", err)
+		os.Exit(1)
+	}
+
+	// Очищаем экран при выходе
+	fmt.Print("\033[H\033[2J")
 }
