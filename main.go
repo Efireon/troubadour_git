@@ -56,9 +56,13 @@ type NetworkInfo struct {
 }
 
 type GPUInfo struct {
-	Model  string
-	Memory string
-	Driver string
+	Model         string
+	Memory        string
+	Driver        string
+	Vendor        string
+	Architecture  string
+	Resolution    string
+	OpenGLVersion string
 }
 
 type StorageInfo struct {
@@ -98,6 +102,7 @@ const (
 	stateAskVideoOk
 	stateAskSerial
 	stateCheckSerial
+	stateSerialSuccess // Новое состояние для успешной проверки серийного номера
 	stateSerialError
 	stateCreateLogs
 	stateDone
@@ -225,7 +230,7 @@ func getProcessorInfo() (ProcessorInfo, error) {
 	// Получаем количество физических ядер
 	physicalCoresCmd := exec.Command("sh", "-c", "grep 'cpu cores' /proc/cpuinfo | uniq | awk '{print $4}'")
 	physicalCoresOutput, err := physicalCoresCmd.Output()
-	if err == nil {
+	if err == nil && len(strings.TrimSpace(string(physicalCoresOutput))) > 0 {
 		info.Cores, _ = strconv.Atoi(strings.TrimSpace(string(physicalCoresOutput)))
 	}
 
@@ -233,7 +238,7 @@ func getProcessorInfo() (ProcessorInfo, error) {
 	if info.Cores == 0 {
 		physicalCoresCmd = exec.Command("sh", "-c", "cat /proc/cpuinfo | grep 'physical id' | sort -u | wc -l")
 		physicalCoresOutput, err := physicalCoresCmd.Output()
-		if err == nil {
+		if err == nil && len(strings.TrimSpace(string(physicalCoresOutput))) > 0 {
 			info.Cores, _ = strconv.Atoi(strings.TrimSpace(string(physicalCoresOutput)))
 		}
 	}
@@ -245,19 +250,30 @@ func getProcessorInfo() (ProcessorInfo, error) {
 		info.Threads, _ = strconv.Atoi(strings.TrimSpace(string(threadsOutput)))
 	}
 
-	// Получаем частоту
-	freqCmd := exec.Command("sh", "-c", "lscpu | grep 'CPU MHz' | awk '{print $3}'")
+	// Исправленный метод определения частоты CPU
+	// Сначала пробуем scaling_max_freq
+	freqCmd := exec.Command("sh", "-c", "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo ''")
 	freqOutput, err := freqCmd.Output()
-	if err == nil {
-		freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(string(freqOutput)), 64)
-		info.Frequency = fmt.Sprintf("%.1f GHz", freqMHz/1000.0)
+	if err == nil && len(strings.TrimSpace(string(freqOutput))) > 0 {
+		freqKHz, _ := strconv.ParseFloat(strings.TrimSpace(string(freqOutput)), 64)
+		info.Frequency = fmt.Sprintf("%.1f GHz", freqKHz/1000000.0)
 	} else {
-		// Если не удалось получить из lscpu, пробуем получить из cpuinfo
-		freqRegex := regexp.MustCompile(`cpu MHz\s*:\s*(.+)`)
-		freq := freqRegex.FindSubmatch(cpuinfo)
-		if len(freq) > 1 {
-			freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(string(freq[1])), 64)
+		// Пробуем через lscpu
+		lscpuCmd := exec.Command("sh", "-c", "lscpu | grep 'CPU MHz' | head -1 | awk '{print $3}'")
+		lscpuOutput, err := lscpuCmd.Output()
+		if err == nil && len(strings.TrimSpace(string(lscpuOutput))) > 0 {
+			freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(string(lscpuOutput)), 64)
 			info.Frequency = fmt.Sprintf("%.1f GHz", freqMHz/1000.0)
+		} else {
+			// Пробуем напрямую из /proc/cpuinfo
+			cpuFreqRegex := regexp.MustCompile(`cpu MHz\s*:\s*([0-9.]+)`)
+			cpuFreqMatch := cpuFreqRegex.FindSubmatch(cpuinfo)
+			if len(cpuFreqMatch) > 1 {
+				freqMHz, _ := strconv.ParseFloat(strings.TrimSpace(string(cpuFreqMatch[1])), 64)
+				info.Frequency = fmt.Sprintf("%.1f GHz", freqMHz/1000.0)
+			} else {
+				info.Frequency = "Unknown"
+			}
 		}
 	}
 
@@ -389,48 +405,68 @@ func getNetworkInfo() ([]NetworkInfo, error) {
 			netInfo.MAC = strings.TrimSpace(string(macBytes))
 		}
 
-		// Получаем модель для конкретного интерфейса
-		// Сначала определяем путь к устройству через readlink
-		devicePath, err := os.Readlink(filepath.Join(netDir, ifName))
+		// Получаем модель устройства через lspci
+		devicePath, err := os.Readlink(filepath.Join(netDir, ifName, "device"))
 		if err == nil {
-			// Ищем информацию о производителе устройства
-			vendorCmdStr := fmt.Sprintf("lspci | grep -i $(basename \"%s\" | cut -d: -f1) | head -1", devicePath)
-			vendorCmd := exec.Command("sh", "-c", vendorCmdStr)
-			vendorOutput, err := vendorCmd.Output()
+			// Получаем информацию о производителе устройства через lspci
+			busID := filepath.Base(devicePath)
+			vendorInfoCmd := exec.Command("sh", "-c", fmt.Sprintf("lspci -v -s %s | grep -i 'Subsystem'", busID))
+			vendorOutput, err := vendorInfoCmd.Output()
 			if err == nil && len(vendorOutput) > 0 {
-				netInfo.Model = strings.TrimSpace(string(vendorOutput))
+				netInfo.Model = strings.TrimSpace(strings.Replace(string(vendorOutput), "Subsystem:", "", 1))
 			} else {
-				// Пробуем другой подход с ethtool
-				ethtoolCmd := exec.Command("ethtool", "-i", ifName)
-				ethtoolOutput, err := ethtoolCmd.Output()
-				if err == nil {
-					lines := strings.Split(string(ethtoolOutput), "\n")
-					for _, line := range lines {
-						if strings.HasPrefix(line, "driver:") {
-							parts := strings.SplitN(line, ":", 2)
-							if len(parts) > 1 {
-								netInfo.Model = strings.TrimSpace(parts[1])
-							}
-						}
+				// Пробуем получить информацию с помощью lshw
+				lshwCmd := exec.Command("sh", "-c", fmt.Sprintf("lshw -c network -businfo | grep %s | head -1", ifName))
+				lshwOutput, err := lshwCmd.Output()
+				if err == nil && len(lshwOutput) > 0 {
+					parts := strings.Fields(string(lshwOutput))
+					if len(parts) >= 3 {
+						netInfo.Model = parts[2]
 					}
 				}
 			}
 		}
 
-		// Если не удалось получить модель другими способами, пробуем через модуль
+		// Если все еще нет модели, попробуем через ethtool
 		if netInfo.Model == "" {
-			moduleCmd := exec.Command("sh", "-c", fmt.Sprintf("basename $(readlink -f /sys/class/net/%s/device/driver/module 2>/dev/null) 2>/dev/null || echo 'Unknown'", ifName))
-			moduleOutput, err := moduleCmd.Output()
+			ethtoolCmd := exec.Command("ethtool", "-i", ifName)
+			ethtoolOutput, err := ethtoolCmd.Output()
 			if err == nil {
-				module := strings.TrimSpace(string(moduleOutput))
-				if module != "Unknown" {
-					netInfo.Model = fmt.Sprintf("Driver: %s", module)
-				} else {
-					netInfo.Model = "Network Interface"
+				lines := strings.Split(string(ethtoolOutput), "\n")
+				var driverInfo, versionInfo string
+
+				for _, line := range lines {
+					if strings.HasPrefix(line, "driver:") {
+						parts := strings.SplitN(line, ":", 2)
+						if len(parts) > 1 {
+							driverInfo = strings.TrimSpace(parts[1])
+						}
+					} else if strings.HasPrefix(line, "version:") {
+						parts := strings.SplitN(line, ":", 2)
+						if len(parts) > 1 {
+							versionInfo = strings.TrimSpace(parts[1])
+						}
+					} else if strings.HasPrefix(line, "firmware-version:") {
+						parts := strings.SplitN(line, ":", 2)
+						if len(parts) > 1 {
+							// Добавляем версию прошивки, если доступна
+							versionInfo += " (fw: " + strings.TrimSpace(parts[1]) + ")"
+						}
+					}
 				}
-			} else {
-				netInfo.Model = "Network Interface"
+
+				if driverInfo != "" {
+					netInfo.Model = driverInfo
+					if versionInfo != "" {
+						netInfo.Model += " " + versionInfo
+					}
+				}
 			}
+		}
+
+		// Если до сих пор не получили модель, используем общее название
+		if netInfo.Model == "" {
+			netInfo.Model = "Network Interface"
 		}
 
 		interfaces = append(interfaces, netInfo)
@@ -448,16 +484,54 @@ func getGPUInfo() (GPUInfo, error) {
 	if err == nil && len(output) > 0 {
 		info.Model = strings.TrimSpace(string(output))
 
-		// Пробуем получить более подробную информацию с помощью различных инструментов
+		// Получаем дополнительную информацию о GPU
 
-		// Пробуем nvidia-smi для NVIDIA карт
-		nvidiaCmd := exec.Command("sh", "-c", "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
+		// 1. Пробуем glxinfo для получения общей информации
+		glxInfoCmd := exec.Command("sh", "-c", "glxinfo | grep -E 'OpenGL vendor|OpenGL renderer|OpenGL version'")
+		glxInfoOutput, err := glxInfoCmd.Output()
+		if err == nil && len(glxInfoOutput) > 0 {
+			glxLines := strings.Split(string(glxInfoOutput), "\n")
+			for _, line := range glxLines {
+				if strings.Contains(line, "OpenGL vendor") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) > 1 {
+						info.Vendor = strings.TrimSpace(parts[1])
+					}
+				} else if strings.Contains(line, "OpenGL renderer") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) > 1 {
+						if info.Model == "" {
+							info.Model = strings.TrimSpace(parts[1])
+						}
+					}
+				} else if strings.Contains(line, "OpenGL version") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) > 1 {
+						info.OpenGLVersion = strings.TrimSpace(parts[1])
+					}
+				}
+			}
+		}
+
+		// 2. Получаем разрешение экрана
+		resolutionCmd := exec.Command("sh", "-c", "xrandr --current | grep '*' | awk '{print $1}'")
+		resolutionOutput, err := resolutionCmd.Output()
+		if err == nil && len(resolutionOutput) > 0 {
+			info.Resolution = strings.TrimSpace(string(resolutionOutput))
+		}
+
+		// 3. Пробуем nvidia-smi для NVIDIA карт
+		nvidiaCmd := exec.Command("sh", "-c", "nvidia-smi --query-gpu=name,memory.total,architecture --format=csv,noheader")
 		nvidiaOutput, err := nvidiaCmd.Output()
 		if err == nil && len(nvidiaOutput) > 0 {
 			parts := strings.Split(string(nvidiaOutput), ",")
 			if len(parts) >= 2 {
 				info.Model = strings.TrimSpace(parts[0])
 				info.Memory = strings.TrimSpace(parts[1])
+
+				if len(parts) >= 3 {
+					info.Architecture = strings.TrimSpace(parts[2])
+				}
 
 				// Получаем версию драйвера
 				driverCmd := exec.Command("sh", "-c", "nvidia-smi --query-gpu=driver_version --format=csv,noheader")
@@ -468,37 +542,36 @@ func getGPUInfo() (GPUInfo, error) {
 			}
 		} else {
 			// Пробуем для AMD карт
-			amdCmd := exec.Command("sh", "-c", "glxinfo | grep 'OpenGL renderer'")
+			amdCmd := exec.Command("sh", "-c", "lspci -v | grep -A 10 VGA | grep -i amdgpu")
 			amdOutput, err := amdCmd.Output()
 			if err == nil && len(amdOutput) > 0 {
-				rendererRegex := regexp.MustCompile(`OpenGL renderer string: (.+)`)
-				match := rendererRegex.FindStringSubmatch(string(amdOutput))
-				if len(match) > 1 {
-					info.Model = match[1]
+				// Если это AMD карта, пытаемся получить версию драйвера
+				amdDriverCmd := exec.Command("sh", "-c", "grep -i 'amdgpu' /var/log/Xorg.0.log | grep 'Driver for'")
+				amdDriverOutput, err := amdDriverCmd.Output()
+				if err == nil && len(amdDriverOutput) > 0 {
+					info.Driver = strings.TrimSpace(string(amdDriverOutput))
+				} else {
+					info.Driver = "AMD GPU Driver"
+				}
 
-					// Получаем версию драйвера
-					versionCmd := exec.Command("sh", "-c", "glxinfo | grep 'OpenGL version'")
-					versionOutput, err := versionCmd.Output()
-					if err == nil && len(versionOutput) > 0 {
-						versionRegex := regexp.MustCompile(`OpenGL version string: (.+)`)
-						match := versionRegex.FindStringSubmatch(string(versionOutput))
-						if len(match) > 1 {
-							info.Driver = match[1]
-						}
-					}
+				// Дополнительно пробуем получить архитектуру AMD GPU
+				amdArchCmd := exec.Command("sh", "-c", "lspci -v | grep -A 20 VGA | grep -i 'Architecture'")
+				amdArchOutput, _ := amdArchCmd.Output()
+				if len(amdArchOutput) > 0 {
+					info.Architecture = strings.TrimSpace(string(amdArchOutput))
 				}
 			} else {
 				// Проверяем Intel Graphics
-				intelCmd := exec.Command("sh", "-c", "lspci | grep -i 'vga' | grep -i 'intel'")
+				intelCmd := exec.Command("sh", "-c", "lspci -v | grep -A 10 VGA | grep -i intel")
 				intelOutput, err := intelCmd.Output()
 				if err == nil && len(intelOutput) > 0 {
-					info.Model = "Intel Integrated Graphics"
+					info.Driver = "Intel Graphics Driver"
 
-					// Пытаемся получить версию драйвера
-					driverCmd := exec.Command("sh", "-c", "glxinfo | grep 'OpenGL version'")
-					driverOutput, err := driverCmd.Output()
-					if err == nil && len(driverOutput) > 0 {
-						info.Driver = string(driverOutput)
+					// Пытаемся получить версию драйвера Intel
+					intelVersionCmd := exec.Command("sh", "-c", "grep -i 'intel' /var/log/Xorg.0.log | grep 'version'")
+					intelVersionOutput, _ := intelVersionCmd.Output()
+					if len(intelVersionOutput) > 0 {
+						info.Driver = strings.TrimSpace(string(intelVersionOutput))
 					}
 				}
 			}
@@ -740,6 +813,18 @@ func createLogFilesCmd(info SystemInfo, dmidecodeRaw string, testPassed bool, se
 	if info.GPU.Driver != "" {
 		logContent.WriteString(fmt.Sprintf("Driver: %s\n", info.GPU.Driver))
 	}
+	if info.GPU.Vendor != "" {
+		logContent.WriteString(fmt.Sprintf("Vendor: %s\n", info.GPU.Vendor))
+	}
+	if info.GPU.Architecture != "" {
+		logContent.WriteString(fmt.Sprintf("Architecture: %s\n", info.GPU.Architecture))
+	}
+	if info.GPU.Resolution != "" {
+		logContent.WriteString(fmt.Sprintf("Resolution: %s\n", info.GPU.Resolution))
+	}
+	if info.GPU.OpenGLVersion != "" {
+		logContent.WriteString(fmt.Sprintf("OpenGL Version: %s\n", info.GPU.OpenGLVersion))
+	}
 	logContent.WriteString("\n")
 
 	// Информация о накопителях
@@ -780,11 +865,23 @@ type logCreatedMsg struct {
 	fileName string
 }
 
+// Дополнительные флаги для видеотеста
+type testWaitingForInput struct{}
+type testPatternFinishMsg struct{}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Если тест ожидает ввода пользователя, любая клавиша завершает тест
+		if m.videoTestActive && m.videoTestColor == 3 {
+			m.videoTestActive = false
+			m.state = stateAskVideoOk
+			m.showOverlay = true
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -812,6 +909,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateCheckSerial
 				return m, func() tea.Msg {
 					return checkSerialNumberCmd(m.userSerial, m.sysInfo.SerialNumber)
+				}
+
+			case stateSerialSuccess:
+				// Переходим к созданию логов после успешной проверки серийного номера
+				m.state = stateCreateLogs
+				m.showOverlay = true
+				return m, func() tea.Msg {
+					return createLogFilesCmd(m.sysInfo, m.dmidecodeRaw, m.testPassed, true)
 				}
 
 			case stateSerialError:
@@ -881,15 +986,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.videoTestActive {
 			elapsedSeconds := int(time.Since(m.videoTestStart).Seconds())
 
-			// Каждые 2 секунды меняем цвет (красный -> зеленый -> синий -> тестовая таблица -> завершение)
-			if elapsedSeconds >= 8 {
-				// Завершаем тест после 8 секунд
-				m.videoTestActive = false
-				m.state = stateAskVideoOk
-				return m, nil
+			// Последняя фаза теста - SMPTE таблица - ожидает ввода пользователя
+			if m.videoTestColor == 3 {
+				// Продолжаем показывать тестовую таблицу, ожидая ввода
+				return m, tea.Tick(time.Second, func(time.Time) tea.Msg {
+					return videoTestTimerTickMsg{}
+				})
+			}
+
+			// Каждые 2 секунды меняем цвет (красный -> зеленый -> синий -> тестовая таблица)
+			if elapsedSeconds >= 6 {
+				// Переходим к тестовой таблице SMPTE и ждем ввода пользователя
+				m.videoTestColor = 3 // Устанавливаем последний тестовый паттерн
+				// Продолжаем таймер для обновления оставшегося времени
+				return m, tea.Tick(time.Second, func(time.Time) tea.Msg {
+					return videoTestTimerTickMsg{}
+				})
 			} else {
 				// Меняем цвет каждые 2 секунды
-				m.videoTestColor = (elapsedSeconds / 2) % 4
+				m.videoTestColor = (elapsedSeconds / 2) % 3 // Только первые три цвета
 				// Продолжаем таймер
 				return m, tea.Tick(time.Second, func(time.Time) tea.Msg {
 					return videoTestTimerTickMsg{}
@@ -904,13 +1019,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case serialMatchedMsg:
-		// Серийный номер совпал, создаем логи
-		m.state = stateCreateLogs
+		// Серийный номер совпал, показываем сообщение об успехе
+		m.state = stateSerialSuccess
 		m.showOverlay = true
 		m.serialMatched = true
-		return m, func() tea.Msg {
-			return createLogFilesCmd(m.sysInfo, m.dmidecodeRaw, m.testPassed, true)
-		}
+		return m, nil
 
 	case serialMismatchMsg:
 		// Серийный номер не совпал, показываем ошибку
@@ -974,6 +1087,15 @@ func (m model) View() string {
 		Padding(1, 2).
 		Align(lipgloss.Center)
 
+	successStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color("#00AA00")).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#008800")).
+		Padding(1, 2).
+		Align(lipgloss.Center)
+
 	footerStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#CDCDCD")).
 		Padding(0, 2)
@@ -989,33 +1111,43 @@ func (m model) View() string {
 	if m.videoTestActive {
 		var colorBg string
 		var colorName string
+		var progressInfo string
 
 		switch m.videoTestColor {
 		case 0:
 			colorBg = "#FF0000"
 			colorName = "RED"
+			progressInfo = fmt.Sprintf(
+				"Testing video... %s (1/4) [%d sec remaining]",
+				colorName,
+				6-int(time.Since(m.videoTestStart).Seconds()),
+			)
 		case 1:
 			colorBg = "#00FF00"
 			colorName = "GREEN"
+			progressInfo = fmt.Sprintf(
+				"Testing video... %s (2/4) [%d sec remaining]",
+				colorName,
+				6-int(time.Since(m.videoTestStart).Seconds())-2,
+			)
 		case 2:
 			colorBg = "#0000FF"
 			colorName = "BLUE"
+			progressInfo = fmt.Sprintf(
+				"Testing video... %s (3/4) [%d sec remaining]",
+				colorName,
+				6-int(time.Since(m.videoTestStart).Seconds())-4,
+			)
 		case 3:
 			// Настроечная таблица SMPTE HD
-			return drawSMPTETestPattern(m.width, m.height, 8-int(time.Since(m.videoTestStart).Seconds()))
+			return drawSMPTETestPattern(m.width, m.height, 0)
 		}
 
+		// Создаем фон на весь экран с соответствующим цветом
 		testBg := lipgloss.NewStyle().
 			Background(lipgloss.Color(colorBg)).
 			Width(m.width).
 			Height(m.height - 2)
-
-		progressInfo := fmt.Sprintf(
-			"Testing video... %s (%d/4) [%d sec remaining]",
-			colorName,
-			m.videoTestColor+1,
-			8-int(time.Since(m.videoTestStart).Seconds()),
-		)
 
 		return fmt.Sprintf(
 			"%s\n%s",
@@ -1102,19 +1234,26 @@ func (m model) View() string {
 	// Формируем правую колонку
 	rightCol := strings.Builder{}
 
-	// Память
+	// Память - исправленное форматирование с правильным выравниванием
 	memContent := strings.Builder{}
 	memContent.WriteString(fmt.Sprintf("Total: %s\n\n", m.sysInfo.Memory.Total))
 
 	for _, slot := range m.sysInfo.Memory.Slots {
-		memContent.WriteString(fmt.Sprintf("Slot %s: %s %s\n",
-			slot.ID, slot.Manufacturer, slot.Size))
-		if slot.Speed != "" || slot.Type != "" {
-			memContent.WriteString(fmt.Sprintf("         %s %s\n\n",
-				slot.Speed, slot.Type))
-		} else {
-			memContent.WriteString("\n")
+		// Очистка строк от спецсимволов и корректное выравнивание
+		slotManu := strings.TrimSpace(strings.ReplaceAll(slot.Manufacturer, "\n", " "))
+		slotSize := strings.TrimSpace(strings.ReplaceAll(slot.Size, "\n", " "))
+		slotSpeed := strings.TrimSpace(strings.ReplaceAll(slot.Speed, "\n", " "))
+		slotType := strings.TrimSpace(strings.ReplaceAll(slot.Type, "\n", " "))
+
+		// Ограничиваем длину строк для предотвращения переполнения
+		if len(slotManu) > 15 {
+			slotManu = slotManu[:15] + "..."
 		}
+
+		memContent.WriteString(fmt.Sprintf("Slot %s: %s %s\n",
+			slot.ID, slotManu, slotSize))
+		memContent.WriteString(fmt.Sprintf("        %s %s\n\n",
+			slotSpeed, slotType))
 	}
 
 	rightCol.WriteString(sectionStyle.Width(rightColWidth).Render(
@@ -1124,14 +1263,38 @@ func (m model) View() string {
 		),
 	))
 
-	// GPU
+	// GPU - улучшенный вывод с дополнительной информацией и очисткой от спецсимволов
 	gpuContent := strings.Builder{}
-	gpuContent.WriteString(fmt.Sprintf("Model: %s\n", m.sysInfo.GPU.Model))
-	if m.sysInfo.GPU.Memory != "" {
-		gpuContent.WriteString(fmt.Sprintf("Memory: %s\n", m.sysInfo.GPU.Memory))
+
+	// Очистка и форматирование информации о GPU
+	gpuModel := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Model, "\n", " "))
+	if len(gpuModel) > rightColWidth-10 { // Ограничиваем длину для предотвращения переполнения
+		gpuModel = gpuModel[:rightColWidth-10] + "..."
 	}
+
+	gpuContent.WriteString(fmt.Sprintf("Model: %s\n", gpuModel))
+
+	if m.sysInfo.GPU.Memory != "" {
+		gpuMem := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Memory, "\n", " "))
+		gpuContent.WriteString(fmt.Sprintf("Memory: %s\n", gpuMem))
+	}
+
 	if m.sysInfo.GPU.Driver != "" {
-		gpuContent.WriteString(fmt.Sprintf("Driver: %s\n", m.sysInfo.GPU.Driver))
+		gpuDriver := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Driver, "\n", " "))
+		if len(gpuDriver) > rightColWidth-10 {
+			gpuDriver = gpuDriver[:rightColWidth-10] + "..."
+		}
+		gpuContent.WriteString(fmt.Sprintf("Driver: %s\n", gpuDriver))
+	}
+
+	if m.sysInfo.GPU.Vendor != "" {
+		gpuVendor := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Vendor, "\n", " "))
+		gpuContent.WriteString(fmt.Sprintf("Vendor: %s\n", gpuVendor))
+	}
+
+	if m.sysInfo.GPU.Resolution != "" {
+		gpuRes := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Resolution, "\n", " "))
+		gpuContent.WriteString(fmt.Sprintf("Resolution: %s\n", gpuRes))
 	}
 
 	rightCol.WriteString("\n\n")
@@ -1183,11 +1346,21 @@ func (m model) View() string {
 			leftColWidth, leftRows[i], rightColWidth, rightRows[i]))
 	}
 
+	// Создаем вид, который заполняет весь доступный экран
+	headerHeight := 1                                           // Высота заголовка
+	footerHeight := 1                                           // Высота футера
+	contentHeight := m.height - headerHeight - footerHeight - 4 // Учитываем отступы
+
+	// Расширяем стили для использования всего доступного пространства
+	fullWidthTitleStyle := titleStyle.Width(m.width)
+	fullWidthBorderStyle := borderStyle.Width(m.width - 4).Height(contentHeight)
+	fullWidthFooterStyle := footerStyle.Width(m.width)
+
 	baseView := fmt.Sprintf(
 		"%s\n%s\n\n%s",
-		titleStyle.Render("TROUBADOUR"),
-		borderStyle.Render(mainContent.String()),
-		footerStyle.Render("Press ENTER to continue to video test..."),
+		fullWidthTitleStyle.Render("TROUBADOUR"),
+		fullWidthBorderStyle.Render(mainContent.String()),
+		fullWidthFooterStyle.Render("Press ENTER to continue to video test..."),
 	)
 
 	// Если не нужно показывать оверлей, возвращаем базовый вид
@@ -1202,7 +1375,7 @@ func (m model) View() string {
 	case stateAskVideoOk:
 		overlayContent = fmt.Sprintf(
 			"%s\n\n%s\n\n%s",
-			lipgloss.NewStyle().Bold(true).Render("Video Test Completed"),
+			lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#00AAFF")).Render("Video Test Completed"),
 			"Did all test patterns display correctly?",
 			"[Y] Yes (default)   [n] No, run test again",
 		)
@@ -1213,6 +1386,19 @@ func (m model) View() string {
 			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification"),
 			fmt.Sprintf("System Serial Number: %s", m.sysInfo.SerialNumber),
 			fmt.Sprintf("Please enter Serial Number: %s", m.textInput.View()),
+		)
+
+	case stateSerialSuccess:
+		// Новый случай для успешной проверки серийного номера
+		successBox := successStyle.Width(45).Render(fmt.Sprintf(
+			"Serial numbers match!\n\nSystem: %s\nEntered: %s\n\nPress ENTER to continue",
+			m.sysInfo.SerialNumber, m.userSerial,
+		))
+
+		overlayContent = fmt.Sprintf(
+			"%s\n\n%s",
+			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification Successful"),
+			successBox,
 		)
 
 	case stateSerialError:
@@ -1256,27 +1442,17 @@ func (m model) View() string {
 
 	overlay := overlayStyle.Width(overlayWidth).Render(overlayContent)
 
-	// Собираем финальный вид с оверлеем
-	return lipgloss.Place(
+	// Исправление для липглосс - без WithBackground
+	// Создаем эффект наложения вручную
+	return lipgloss.PlaceHorizontal(
 		m.width,
-		m.height,
 		lipgloss.Center,
-		lipgloss.Center,
-		overlay,
-		lipgloss.WithBackground(baseView),
+		lipgloss.PlaceVertical(
+			m.height,
+			lipgloss.Center,
+			overlay,
+		),
 	)
-
-	// Если произошла ошибка
-	if m.err != nil {
-		return borderStyle.Render(fmt.Sprintf(
-			"%s\n\n%s\n\n%s",
-			titleStyle.Render("TROUBADOUR"),
-			errorStyle.Render(fmt.Sprintf("ERROR: %v", m.err)),
-			footerStyle.Render("Press any key to exit"),
-		))
-	}
-
-	return "Loading..."
 }
 
 func main() {
@@ -1365,11 +1541,8 @@ func drawSMPTETestPattern(width, height, timeRemaining int) string {
 		result.WriteString("\n")
 	}
 
-	// Добавляем информацию о прогрессе теста
-	progressInfo := fmt.Sprintf(
-		"Testing video... SMPTE HD Test Pattern (4/4) [%d sec remaining]",
-		timeRemaining,
-	)
+	// Добавляем информацию о необходимости нажать клавишу для продолжения
+	progressInfo := "Press any key to continue..."
 
 	return fmt.Sprintf(
 		"%s%s",
@@ -1379,6 +1552,7 @@ func drawSMPTETestPattern(width, height, timeRemaining int) string {
 			Width(width).
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(lipgloss.Color("#000000")).
+			Bold(true).
 			Render(progressInfo),
 	)
 }

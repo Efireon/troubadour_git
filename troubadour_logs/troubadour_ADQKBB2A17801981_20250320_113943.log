@@ -1,0 +1,86 @@
+==== TROUBADOUR SYSTEM DIAGNOSTICS LOG ====
+
+Date: Thu, 20 Mar 2025 11:39:43 MSK
+Serial Number: ADQKBB2A17801981
+
+==== PROCESSOR ====
+Model: AMD Ryzen 5 5600H with Radeon Graphics
+Cores: 6 (Threads: 12)
+Frequency: 4.3 GHz
+Cache:
+  L1: 192 KiB
+  L2: 3 MiB
+  L3: 16 MiB
+
+==== MEMORY ====
+Total: 14 GB
+Slot 1: Samsung 8 GB @ 3200 MT/s [DDR4]
+Slot 2: Samsung 8 GB @ 3200 MT/s [DDR4]
+
+==== NETWORK ====
+Interface: br-5a27c997d52e
+Model: bridge 2.3 (fw: N/A)
+MAC: 02:42:35:e7:7b:f3
+
+Interface: br-da555d2b3c70
+Model: bridge 2.3 (fw: N/A)
+MAC: 02:42:5f:bd:af:6e
+
+Interface: docker0
+Model: bridge 2.3 (fw: N/A)
+MAC: 02:42:f7:c9:47:c2
+
+Interface: tun0
+Model: tun 1.6 (fw: )
+MAC: 
+
+Interface: virbr0
+Model: bridge 2.3 (fw: N/A)
+MAC: a2:98:e0:ea:82:12
+
+Interface: virbr2
+Model: bridge 2.3 (fw: N/A)
+MAC: 52:54:00:ac:ac:fa
+
+Interface: virbr3
+Model: bridge 2.3 (fw: N/A)
+MAC: 52:54:00:58:d0:10
+
+Interface: wlan0
+Model: Foxconn International, Inc. Device e0ca
+MAC: 10:6f:d9:f1:d7:b7
+
+==== GPU ====
+Model: 04:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Cezanne [Radeon Vega Series / Radeon Vega Mobile Series] (rev c6)
+
+==== STORAGE ====
+Type: SATA/IDE
+Model: 
+Size: 4G
+
+Type: NVMe
+Model: SAMSUNG MZVL2512HCJQ-00B00
+Size: 476,9G
+
+==== TEST RESULTS ====
+Video Test Passed: true
+Serial Number Check: true
+Entered Serial Number: ADQKBB2A17801981
+System Serial Number: ADQKBB2A17801981
+
+==== RAW DMIDECODE DATA ====
+# dmidecode 3.6
+Getting SMBIOS data from sysfs.
+SMBIOS 3.3.0 present.
+
+Handle 0x0001, DMI type 1, 27 bytes
+System Information
+	Manufacturer: HONOR
+	Product Name: HYM-WXX
+	Version: M1020
+	Serial Number: ADQKBB2A17801981
+	UUID: 20221018-106f-d9f1-d7b7-106fd9f1d7b8
+	Wake-up Type: Other
+	SKU Number: C171
+	Family: MagicBook
+
