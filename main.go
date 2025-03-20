@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,8 +84,10 @@ type model struct {
 	showOverlay     bool      // Показывать ли наложение
 	overlayContent  string    // Содержимое наложения
 	videoTestActive bool      // Активен ли видеотест
-	videoTestColor  int       // Текущий цвет видеотеста (0-red, 1-green, 2-blue)
+	videoTestColor  int       // Текущий цвет видеотеста (0-red, 1-green, 2-blue, 3-testbars)
 	videoTestStart  time.Time // Время начала видеотеста
+	testPassed      bool      // Прошел ли видеотест успешно
+	serialMatched   bool      // Совпал ли серийный номер
 }
 
 // Состояния программы
@@ -367,7 +368,7 @@ func getNetworkInfo() ([]NetworkInfo, error) {
 
 	// Получаем список сетевых интерфейсов
 	netDir := "/sys/class/net/"
-	files, err := ioutil.ReadDir(netDir)
+	files, err := os.ReadDir(netDir)
 	if err != nil {
 		return interfaces, err
 	}
@@ -383,38 +384,51 @@ func getNetworkInfo() ([]NetworkInfo, error) {
 		}
 
 		// Получаем MAC адрес
-		macBytes, err := ioutil.ReadFile(filepath.Join(netDir, ifName, "address"))
+		macBytes, err := os.ReadFile(filepath.Join(netDir, ifName, "address"))
 		if err == nil {
 			netInfo.MAC = strings.TrimSpace(string(macBytes))
 		}
 
-		// Получаем модель/производителя
-		modelCmd := exec.Command("sh", "-c", fmt.Sprintf("lspci | grep -i net | grep -v 'virtual' | head -1 | cut -d: -f3"))
-		modelOutput, err := modelCmd.Output()
-		if err == nil && len(modelOutput) > 0 {
-			netInfo.Model = strings.TrimSpace(string(modelOutput))
-		} else {
-			// Пробуем другой метод
-			ethtoolCmd := exec.Command("ethtool", "-i", ifName)
-			ethtoolOutput, err := ethtoolCmd.Output()
-			if err == nil {
-				lines := strings.Split(string(ethtoolOutput), "\n")
-				for _, line := range lines {
-					if strings.HasPrefix(line, "driver:") {
-						parts := strings.SplitN(line, ":", 2)
-						if len(parts) > 1 {
-							netInfo.Model = strings.TrimSpace(parts[1])
+		// Получаем модель для конкретного интерфейса
+		// Сначала определяем путь к устройству через readlink
+		devicePath, err := os.Readlink(filepath.Join(netDir, ifName))
+		if err == nil {
+			// Ищем информацию о производителе устройства
+			vendorCmdStr := fmt.Sprintf("lspci | grep -i $(basename \"%s\" | cut -d: -f1) | head -1", devicePath)
+			vendorCmd := exec.Command("sh", "-c", vendorCmdStr)
+			vendorOutput, err := vendorCmd.Output()
+			if err == nil && len(vendorOutput) > 0 {
+				netInfo.Model = strings.TrimSpace(string(vendorOutput))
+			} else {
+				// Пробуем другой подход с ethtool
+				ethtoolCmd := exec.Command("ethtool", "-i", ifName)
+				ethtoolOutput, err := ethtoolCmd.Output()
+				if err == nil {
+					lines := strings.Split(string(ethtoolOutput), "\n")
+					for _, line := range lines {
+						if strings.HasPrefix(line, "driver:") {
+							parts := strings.SplitN(line, ":", 2)
+							if len(parts) > 1 {
+								netInfo.Model = strings.TrimSpace(parts[1])
+							}
 						}
 					}
 				}
 			}
 		}
 
-		// Если не удалось получить модель, используем IP link
+		// Если не удалось получить модель другими способами, пробуем через модуль
 		if netInfo.Model == "" {
-			ipLinkCmd := exec.Command("ip", "link", "show", ifName)
-			_, err := ipLinkCmd.Output()
+			moduleCmd := exec.Command("sh", "-c", fmt.Sprintf("basename $(readlink -f /sys/class/net/%s/device/driver/module 2>/dev/null) 2>/dev/null || echo 'Unknown'", ifName))
+			moduleOutput, err := moduleCmd.Output()
 			if err == nil {
+				module := strings.TrimSpace(string(moduleOutput))
+				if module != "Unknown" {
+					netInfo.Model = fmt.Sprintf("Driver: %s", module)
+				} else {
+					netInfo.Model = "Network Interface"
+				}
+			} else {
 				netInfo.Model = "Network Interface"
 			}
 		}
@@ -644,7 +658,7 @@ type videoTestTimerTickMsg struct{}
 // Окончание видеотеста
 type videoTestDoneMsg struct{}
 
-// Команда для проверки серийного номера
+// Проверка серийного номера
 func checkSerialNumberCmd(entered, system string) tea.Msg {
 	if entered == system {
 		return serialMatchedMsg{}
@@ -661,11 +675,24 @@ type serialMismatchMsg struct {
 	system  string
 }
 
+// Перезапустить компьютер
+type restartMsg struct{}
+
+// Выключить компьютер
+type shutdownMsg struct{}
+
 // Команда для создания логов
-func createLogFilesCmd(info SystemInfo, dmidecodeRaw string) tea.Msg {
+func createLogFilesCmd(info SystemInfo, dmidecodeRaw string, testPassed bool, serialMatched bool) tea.Msg {
+	// Создаем директорию для логов
+	logsDir := "./troubadour_logs"
+	err := os.MkdirAll(logsDir, 0755)
+	if err != nil {
+		return errMsg{err}
+	}
+
 	// Создаем имя файла с датой и серийным номером
 	timestamp := time.Now().Format("20060102_150405")
-	fileName := fmt.Sprintf("/tmp/troubadour_%s_%s.log", info.SerialNumber, timestamp)
+	fileName := fmt.Sprintf("%s/troubadour_%s_%s.log", logsDir, info.SerialNumber, timestamp)
 
 	// Форматируем содержимое лога
 	var logContent strings.Builder
@@ -727,12 +754,19 @@ func createLogFilesCmd(info SystemInfo, dmidecodeRaw string) tea.Msg {
 		logContent.WriteString("\n")
 	}
 
+	// Информация о пройденных этапах
+	logContent.WriteString("==== TEST RESULTS ====\n")
+	logContent.WriteString(fmt.Sprintf("Video Test Passed: %t\n", testPassed))
+	logContent.WriteString(fmt.Sprintf("Serial Number Check: %t\n", serialMatched))
+	logContent.WriteString(fmt.Sprintf("Entered Serial Number: %s\n", info.SerialNumber))
+	logContent.WriteString(fmt.Sprintf("System Serial Number: %s\n\n", info.SerialNumber))
+
 	// Добавляем сырой вывод dmidecode
 	logContent.WriteString("==== RAW DMIDECODE DATA ====\n")
 	logContent.WriteString(dmidecodeRaw)
 
 	// Записываем лог в файл
-	err := ioutil.WriteFile(fileName, []byte(logContent.String()), 0644)
+	err = os.WriteFile(fileName, []byte(logContent.String()), 0644)
 	if err != nil {
 		return errMsg{err}
 	}
@@ -769,6 +803,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Если ответ "Y" (по умолчанию), продолжаем к проверке серийника
 				m.state = stateAskSerial
 				m.showOverlay = true
+				m.testPassed = true // Пользователь подтвердил успешное прохождение теста
 				return m, nil
 
 			case stateAskSerial:
@@ -797,7 +832,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.videoTestActive = true
 				m.videoTestColor = 0
 				m.videoTestStart = time.Now()
+				m.testPassed = false // Тест не пройден
 				return m, startVideoTestCmd
+			}
+
+		case "r":
+			if m.state == stateSerialError {
+				// Перезапуск системы
+				return m, func() tea.Msg {
+					exec.Command("reboot").Run()
+					return restartMsg{}
+				}
+			}
+
+		case "e":
+			if m.state == stateSerialError {
+				// Выключение системы
+				return m, func() tea.Msg {
+					exec.Command("poweroff").Run()
+					return shutdownMsg{}
+				}
 			}
 		}
 
@@ -827,14 +881,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.videoTestActive {
 			elapsedSeconds := int(time.Since(m.videoTestStart).Seconds())
 
-			// Каждые 3 секунды меняем цвет (красный -> зеленый -> синий -> завершение)
-			if elapsedSeconds >= 9 {
-				// Завершаем тест после 9 секунд
+			// Каждые 2 секунды меняем цвет (красный -> зеленый -> синий -> тестовая таблица -> завершение)
+			if elapsedSeconds >= 8 {
+				// Завершаем тест после 8 секунд
 				m.videoTestActive = false
 				m.state = stateAskVideoOk
 				return m, nil
 			} else {
-				m.videoTestColor = (elapsedSeconds / 3) % 3
+				// Меняем цвет каждые 2 секунды
+				m.videoTestColor = (elapsedSeconds / 2) % 4
 				// Продолжаем таймер
 				return m, tea.Tick(time.Second, func(time.Time) tea.Msg {
 					return videoTestTimerTickMsg{}
@@ -852,8 +907,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Серийный номер совпал, создаем логи
 		m.state = stateCreateLogs
 		m.showOverlay = true
+		m.serialMatched = true
 		return m, func() tea.Msg {
-			return createLogFilesCmd(m.sysInfo, m.dmidecodeRaw)
+			return createLogFilesCmd(m.sysInfo, m.dmidecodeRaw, m.testPassed, true)
 		}
 
 	case serialMismatchMsg:
@@ -861,6 +917,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateSerialError
 		m.userSerial = msg.entered
 		m.showOverlay = true
+		m.serialMatched = false
 		return m, nil
 
 	case logCreatedMsg:
@@ -889,8 +946,7 @@ func (m model) View() string {
 		Bold(true).
 		Foreground(lipgloss.Color("#FAFAFA")).
 		Background(lipgloss.Color("#1D1D1D")).
-		MarginTop(1).
-		MarginBottom(1).
+		Margin(0).
 		Width(m.width).
 		Align(lipgloss.Center)
 
@@ -944,6 +1000,9 @@ func (m model) View() string {
 		case 2:
 			colorBg = "#0000FF"
 			colorName = "BLUE"
+		case 3:
+			// Настроечная таблица SMPTE HD
+			return drawSMPTETestPattern(m.width, m.height, 8-int(time.Since(m.videoTestStart).Seconds()))
 		}
 
 		testBg := lipgloss.NewStyle().
@@ -952,10 +1011,10 @@ func (m model) View() string {
 			Height(m.height - 2)
 
 		progressInfo := fmt.Sprintf(
-			"Testing video... %s (%d/3) [%d sec remaining]",
+			"Testing video... %s (%d/4) [%d sec remaining]",
 			colorName,
 			m.videoTestColor+1,
-			9-int(time.Since(m.videoTestStart).Seconds()),
+			8-int(time.Since(m.videoTestStart).Seconds()),
 		)
 
 		return fmt.Sprintf(
@@ -977,6 +1036,16 @@ func (m model) View() string {
 			titleStyle.Render("TROUBADOUR"),
 			lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width-6).Render("Collecting system information..."),
 			lipgloss.NewStyle().Align(lipgloss.Center).Width(m.width-6).Render(m.spinner.View()),
+		))
+	}
+
+	// Если произошла ошибка
+	if m.err != nil {
+		return borderStyle.Render(fmt.Sprintf(
+			"%s\n\n%s\n\n%s",
+			titleStyle.Render("TROUBADOUR"),
+			errorStyle.Render(fmt.Sprintf("ERROR: %v", m.err)),
+			footerStyle.Render("Press any key to exit"),
 		))
 	}
 
@@ -1040,8 +1109,12 @@ func (m model) View() string {
 	for _, slot := range m.sysInfo.Memory.Slots {
 		memContent.WriteString(fmt.Sprintf("Slot %s: %s %s\n",
 			slot.ID, slot.Manufacturer, slot.Size))
-		memContent.WriteString(fmt.Sprintf("         %s %s\n\n",
-			slot.Speed, slot.Type))
+		if slot.Speed != "" || slot.Type != "" {
+			memContent.WriteString(fmt.Sprintf("         %s %s\n\n",
+				slot.Speed, slot.Type))
+		} else {
+			memContent.WriteString("\n")
+		}
 	}
 
 	rightCol.WriteString(sectionStyle.Width(rightColWidth).Render(
@@ -1143,16 +1216,15 @@ func (m model) View() string {
 		)
 
 	case stateSerialError:
-		errorBox := errorStyle.Width(40).Render(fmt.Sprintf(
-			"Serial numbers DO NOT match!\n\nSystem: %s\nEntered: %s",
+		errorBox := errorStyle.Width(45).Render(fmt.Sprintf(
+			"Serial numbers DO NOT match!\n\nSystem: %s\nEntered: %s\n\n[R] Restart system\n[E] Shutdown system\n[ENTER] Try again",
 			m.sysInfo.SerialNumber, m.userSerial,
 		))
 
 		overlayContent = fmt.Sprintf(
-			"%s\n\n%s\n\n%s",
-			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification"),
+			"%s\n\n%s",
+			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification Failed"),
 			errorBox,
-			"Press ENTER to try again",
 		)
 
 	case stateCreateLogs:
@@ -1191,6 +1263,7 @@ func (m model) View() string {
 		lipgloss.Center,
 		lipgloss.Center,
 		overlay,
+		lipgloss.WithBackground(baseView),
 	)
 
 	// Если произошла ошибка
@@ -1230,4 +1303,82 @@ func main() {
 
 	// Очищаем экран при выходе
 	fmt.Print("\033[H\033[2J")
+}
+
+// Функция для отрисовки тестовой таблицы SMPTE HD
+func drawSMPTETestPattern(width, height, timeRemaining int) string {
+	var result strings.Builder
+
+	// Рассчитываем высоту каждой полосы
+	// SMPTE HD тестовая таблица имеет 3 основные секции:
+	// - Верхние 7 цветных полос (75% яркости)
+	// - Средние 7 цветных полос (100% яркости)
+	// - Нижняя секция с различными тестовыми элементами
+
+	rowHeight := (height - 2) / 10
+
+	// Создаем верхние 7 цветных полос (75% яркости)
+	colors75 := []string{"#C0C0C0", "#C0C000", "#00C0C0", "#00C000", "#C000C0", "#C00000", "#0000C0"}
+	colWidth := width / len(colors75)
+
+	// Отрисовываем верхние полосы
+	for row := 0; row < rowHeight*4; row++ {
+		for _, color := range colors75 {
+			result.WriteString(lipgloss.NewStyle().
+				Background(lipgloss.Color(color)).
+				Width(colWidth).
+				Render(""))
+		}
+		result.WriteString("\n")
+	}
+
+	// Отрисовываем средние полосы (100% яркости)
+	colors100 := []string{"#FFFFFF", "#FFFF00", "#00FFFF", "#00FF00", "#FF00FF", "#FF0000", "#0000FF"}
+	for row := 0; row < rowHeight*3; row++ {
+		for _, color := range colors100 {
+			result.WriteString(lipgloss.NewStyle().
+				Background(lipgloss.Color(color)).
+				Width(colWidth).
+				Render(""))
+		}
+		result.WriteString("\n")
+	}
+
+	// Отрисовываем нижние тестовые элементы
+	lowerSection := [][]string{
+		{"#0000C0", "#000000", "#0000C0", "#000000", "#0000C0", "#000000", "#0000C0"},
+		{"#FFFFFF", "#000000", "#FFFFFF", "#000000", "#FFFFFF", "#000000", "#FFFFFF"},
+	}
+
+	for row := 0; row < rowHeight*2; row++ {
+		sectionIdx := row / rowHeight
+		if sectionIdx >= len(lowerSection) {
+			sectionIdx = len(lowerSection) - 1
+		}
+
+		for _, color := range lowerSection[sectionIdx] {
+			result.WriteString(lipgloss.NewStyle().
+				Background(lipgloss.Color(color)).
+				Width(colWidth).
+				Render(""))
+		}
+		result.WriteString("\n")
+	}
+
+	// Добавляем информацию о прогрессе теста
+	progressInfo := fmt.Sprintf(
+		"Testing video... SMPTE HD Test Pattern (4/4) [%d sec remaining]",
+		timeRemaining,
+	)
+
+	return fmt.Sprintf(
+		"%s%s",
+		result.String(),
+		lipgloss.NewStyle().
+			Align(lipgloss.Center).
+			Width(width).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(lipgloss.Color("#000000")).
+			Render(progressInfo),
+	)
 }
