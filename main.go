@@ -726,11 +726,6 @@ func startVideoTestCmd() tea.Msg {
 
 type startVideoTestMsg struct{}
 
-// Таймер для видеотеста
-func videoTestTimerCmd() tea.Msg {
-	return videoTestTimerTickMsg{}
-}
-
 type videoTestTimerTickMsg struct{}
 
 // Окончание видеотеста
@@ -883,48 +878,44 @@ func updateLogoAnimationCmd() tea.Msg {
 // Анимация прогресса
 type progressAnimUpdateMsg struct{}
 
-func updateProgressAnimationCmd() tea.Msg {
-	return progressAnimUpdateMsg{}
-}
-
 // Функция для отображения анимированного логотипа
 func getAnimatedLogo(state int) string {
 	logos := []string{
 		// Состояние 0
 		`  ♪ ♫ ♪  
-.===.<*
-   | T |    
- /___\   
-// | \\  
-\  |  / 
-  |  o  |    
+ .===.<*  
+ | T |    
+ /___\    
+// | \\   
+\  |  /   
+|  o  |   
 ~=====~  `,
 		// Состояние 1
 		`  ♫ ♪ ♫  
-.===.<*
-   | T |    
- /___\   
-// | \\  
-\  |  / 
-  |  o  |    
+ .===.<*  
+ | T |    
+ /___\    
+// | \\   
+\  |  /   
+|  o  |   
 ~=====~  `,
 		// Состояние 2
 		`  ♪ ♫ ♪  
-.===.<*
-   | T |    
- /___\   
-// | \\  
-\  |  / 
-  |  o  |    
+ .===.<*  
+ | T |    
+ /___\    
+// | \\   
+\  |  /   
+|  o  |   
 ~=====~  `,
 		// Состояние 3
 		`  ♫ ♪ ♫  
-.===.<*
-   | T |    
- /___\   
-// | \\  
-\  |  / 
-  |  o  |    
+ .===.<*  
+ | T |    
+ /___\    
+// | \\   
+\  |  /   
+|  o  |   
 ~=====~  `,
 	}
 	return logos[state]
@@ -1230,7 +1221,7 @@ func (m model) View() string {
 			)
 		case 3:
 			// Настроечная таблица SMPTE HD на весь экран
-			return drawSMPTETestPattern(m.width, m.height, 0)
+			return drawSMPTETestPattern(m.width, m.height)
 		}
 
 		// Создаем фон на весь экран с соответствующим цветом
@@ -1292,7 +1283,6 @@ func (m model) View() string {
 	twoColumnMode := m.width >= 100
 
 	// Расчет размеров колонок с учетом границ и отступов
-	columnPadding := 1 // Отступ внутри колонки
 	columnSpacing := 2 // Расстояние между колонками
 	borderWidth := 2   // Ширина границы
 
@@ -1311,11 +1301,6 @@ func (m model) View() string {
 		rightColumnWidth = availableWidth
 	}
 
-	// Ширина для секций внутри колонок (с учетом отступов и границ секций)
-	sectionBorderWidth := 2
-	leftSectionWidth := leftColumnWidth - (sectionBorderWidth * 2) - (columnPadding * 2)
-	rightSectionWidth := rightColumnWidth - (sectionBorderWidth * 2) - (columnPadding * 2)
-
 	// Создаем анимированный логотип в рамке
 	logoStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1330,18 +1315,31 @@ func (m model) View() string {
 	// Формируем левую колонку
 	// ПРОЦЕССОР
 	cpuContent := strings.Builder{}
-	cpuContent.WriteString(fmt.Sprintf("Model: %s\n", truncateString(m.sysInfo.Processor.Model, leftSectionWidth-8)))
+	cpuContent.WriteString(fmt.Sprintf("Model: %s\n", m.sysInfo.Processor.Model))
 	cpuContent.WriteString(fmt.Sprintf("Cores: %d (Threads: %d)\n", m.sysInfo.Processor.Cores, m.sysInfo.Processor.Threads))
 	cpuContent.WriteString(fmt.Sprintf("Freq: %s\n", m.sysInfo.Processor.Frequency))
 
+	// Явно проверяем cache уровни в фиксированном порядке
 	cacheStr := ""
-	for level, size := range m.sysInfo.Processor.Cache {
+	// L1 cache
+	if size, ok := m.sysInfo.Processor.Cache["L1"]; ok {
+		cacheStr += fmt.Sprintf("L1: %s", size)
+	}
+	// L2 cache
+	if size, ok := m.sysInfo.Processor.Cache["L2"]; ok {
 		if cacheStr != "" {
 			cacheStr += ", "
 		}
-		cacheStr += fmt.Sprintf("%s: %s", level, size)
+		cacheStr += fmt.Sprintf("L2: %s", size)
 	}
-	cpuContent.WriteString(fmt.Sprintf("Cache: %s", truncateString(cacheStr, leftSectionWidth-8)))
+	// L3 cache
+	if size, ok := m.sysInfo.Processor.Cache["L3"]; ok {
+		if cacheStr != "" {
+			cacheStr += ", "
+		}
+		cacheStr += fmt.Sprintf("L3: %s", size)
+	}
+	cpuContent.WriteString(fmt.Sprintf("Cache: %s", cacheStr))
 
 	procSection := sectionStyle.Copy().
 		Width(leftColumnWidth - 2).
@@ -1356,7 +1354,7 @@ func (m model) View() string {
 		if net.Model != "" {
 			netContent.WriteString(fmt.Sprintf("%s: %s\n",
 				net.Interface,
-				truncateString(net.Model, leftSectionWidth-len(net.Interface)-3)))
+				net.Model))
 		} else {
 			netContent.WriteString(fmt.Sprintf("%s\n", net.Interface))
 		}
@@ -1383,7 +1381,7 @@ func (m model) View() string {
 
 		memContent.WriteString(fmt.Sprintf("Slot %s: %s %s\n",
 			slot.ID,
-			truncateString(slotManu, rightSectionWidth/4),
+			slotManu,
 			slotSize))
 		memContent.WriteString(fmt.Sprintf("        %s %s\n\n",
 			slotSpeed,
@@ -1397,10 +1395,10 @@ func (m model) View() string {
 			memContent.String(),
 		))
 
-	// GPU
+	// GPU (отображаем без обрезки)
 	gpuContent := strings.Builder{}
 	gpuModel := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Model, "\n", " "))
-	gpuContent.WriteString(fmt.Sprintf("Model: %s\n", truncateString(gpuModel, rightSectionWidth-8)))
+	gpuContent.WriteString(fmt.Sprintf("Model: %s\n", gpuModel))
 
 	if m.sysInfo.GPU.Memory != "" {
 		gpuMem := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Memory, "\n", " "))
@@ -1409,12 +1407,12 @@ func (m model) View() string {
 
 	if m.sysInfo.GPU.Driver != "" {
 		gpuDriver := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Driver, "\n", " "))
-		gpuContent.WriteString(fmt.Sprintf("Driver: %s\n", truncateString(gpuDriver, rightSectionWidth-9)))
+		gpuContent.WriteString(fmt.Sprintf("Driver: %s\n", gpuDriver))
 	}
 
 	if m.sysInfo.GPU.Vendor != "" {
 		gpuVendor := strings.TrimSpace(strings.ReplaceAll(m.sysInfo.GPU.Vendor, "\n", " "))
-		gpuContent.WriteString(fmt.Sprintf("Vendor: %s\n", truncateString(gpuVendor, rightSectionWidth-9)))
+		gpuContent.WriteString(fmt.Sprintf("Vendor: %s\n", gpuVendor))
 	}
 
 	if m.sysInfo.GPU.Resolution != "" {
@@ -1429,18 +1427,32 @@ func (m model) View() string {
 			gpuContent.String(),
 		))
 
-	// ХРАНИЛИЩЕ
+	// ХРАНИЛИЩЕ (улучшенное отображение)
 	storageContent := strings.Builder{}
-	for _, storage := range m.sysInfo.Storage {
-		storageContent.WriteString(fmt.Sprintf("%s: %s %s\n",
-			storage.Type,
-			truncateString(storage.Model, rightSectionWidth-len(storage.Type)-len(storage.Size)-3),
-			storage.Size))
+	for i, storage := range m.sysInfo.Storage {
+		// Добавляем разделитель между устройствами хранения, кроме первого
+		if i > 0 {
+			storageContent.WriteString("─────────────────\n")
+		}
 
+		// Тип и размер на одной строке
+		storageContent.WriteString(fmt.Sprintf("Type: %s (%s)\n", storage.Type, storage.Size))
+
+		// Модель на собственной строке, без обрезания
+		if storage.Model != "" {
+			storageContent.WriteString(fmt.Sprintf("Model: %s\n",
+				strings.TrimSpace(strings.ReplaceAll(storage.Model, "\n", " "))))
+		}
+
+		// Метка, если есть
 		if storage.Label != "" {
 			storageContent.WriteString(fmt.Sprintf("Label: %s\n", storage.Label))
 		}
-		storageContent.WriteString("\n")
+
+		// Добавляем пробел после каждого устройства
+		if i < len(m.sysInfo.Storage)-1 {
+			storageContent.WriteString("\n")
+		}
 	}
 
 	storageSection := sectionStyle.Copy().
@@ -1664,14 +1676,6 @@ func (m model) View() string {
 	)
 }
 
-// Вспомогательная функция для обрезки длинных строк
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-3] + "..."
-}
-
 // Функция для получения максимального значения
 func max(a, b int) int {
 	if a > b {
@@ -1707,7 +1711,7 @@ func main() {
 }
 
 // Функция для отрисовки тестовой таблицы SMPTE HD на весь экран
-func drawSMPTETestPattern(width, height, timeRemaining int) string {
+func drawSMPTETestPattern(width, height int) string {
 	var result strings.Builder
 
 	// Используем всю высоту экрана (без строки статуса внизу)
