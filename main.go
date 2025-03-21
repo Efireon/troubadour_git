@@ -892,35 +892,39 @@ func getAnimatedLogo(state int) string {
 	logos := []string{
 		// Состояние 0
 		`  ♪ ♫ ♪  
-  /T\    
+.===.<*
+   | T |    
  /___\   
 // | \\  
-\\__|__/ 
-  |||    
+\  |  / 
+  |  o  |    
 ~=====~  `,
 		// Состояние 1
 		`  ♫ ♪ ♫  
-  /T\    
+.===.<*
+   | T |    
  /___\   
 // | \\  
-\\__|__/ 
-  \\//   
+\  |  / 
+  |  o  |    
 ~=====~  `,
 		// Состояние 2
 		`  ♪ ♫ ♪  
-  /T\\   
- /___\\  
+.===.<*
+   | T |    
+ /___\   
 // | \\  
-\\__|__/ 
-  //\\   
+\  |  / 
+  |  o  |    
 ~=====~  `,
 		// Состояние 3
 		`  ♫ ♪ ♫  
- //T\    
-//___\   
+.===.<*
+   | T |    
+ /___\   
 // | \\  
-\\__|__/ 
-  |o|    
+\  |  / 
+  |  o  |    
 ~=====~  `,
 	}
 	return logos[state]
@@ -1003,7 +1007,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "r":
-			if m.state == stateSerialError {
+			if m.state == stateDone || m.state == stateSerialError {
 				// Перезапуск системы
 				return m, func() tea.Msg {
 					exec.Command("reboot").Run()
@@ -1012,7 +1016,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "e":
-			if m.state == stateSerialError {
+			if m.state == stateDone || m.state == stateSerialError {
 				// Выключение системы
 				return m, func() tea.Msg {
 					exec.Command("poweroff").Run()
@@ -1545,17 +1549,10 @@ func (m model) View() string {
 			m.sysInfo.SerialNumber, m.userSerial,
 		))
 
-		confetti := []string{
-			"✧･ﾟ: *✧･ﾟ:* \\(^ヮ^)/ *:･ﾟ✧*:･ﾟ✧",
-			"✧*｡٩(ˊᗜˋ*)و✧*｡",
-			"(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧",
-			"(●♡∀♡)",
-		}[m.logoAnimState%4]
-
 		overlayContent = fmt.Sprintf(
 			"%s\n\n%s\n\n%s\n\n%s",
 			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification Successful"),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5D76E")).Render(confetti),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5D76E")).Render(),
 			successBox,
 			"[B] Return to system information",
 		)
@@ -1565,18 +1562,10 @@ func (m model) View() string {
 			"Serial numbers DO NOT match!\n\nSystem: %s\nEntered: %s\n\n[R] Restart system\n[E] Shutdown system\n[ENTER] Try again",
 			m.sysInfo.SerialNumber, m.userSerial,
 		))
-
-		alert := []string{
-			"(╯°□°）╯︵ ┻━┻",
-			"(ノಠ益ಠ)ノ彡┻━┻",
-			"(∩╹□╹∩)",
-			"(●´⌓`●)",
-		}[m.logoAnimState%4]
-
 		overlayContent = fmt.Sprintf(
 			"%s\n\n%s\n\n%s\n\n%s",
 			lipgloss.NewStyle().Bold(true).Render("Serial Number Verification Failed"),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render(alert),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render(),
 			errorBox,
 			"[B] Return to system information",
 		)
@@ -1645,17 +1634,10 @@ func (m model) View() string {
 			Foreground(lipgloss.Color("#EEEEEE")).
 			Render("[E] Выключить систему   [R] Перезагрузить систему   [ENTER] Выход")
 
-		confetti := []string{
-			"✧･ﾟ: *✧･ﾟ:* \\(^ヮ^)/ *:･ﾟ✧*:･ﾟ✧",
-			"✧*｡٩(ˊᗜˋ*)و✧*｡",
-			"(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧",
-			"(●♡∀♡)",
-		}[m.logoAnimState%4]
-
 		overlayContent = fmt.Sprintf(
 			"%s\n\n%s\n\n%s\n\n%s\n\n%s",
 			lipgloss.NewStyle().Bold(true).Render("Diagnostics Completed Successfully"),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5D76E")).Render(confetti),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#F5D76E")).Render(),
 			fmt.Sprintf("Output file: %s", m.logFilePath),
 			logPreview,
 			options,
